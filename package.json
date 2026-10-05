@@ -1,0 +1,18 @@
+{
+  "name": "tg-monitor-bot",
+  "version": "2.0.0",
+  "description": "TG 群骰子开奖监听与自动下注系统（pc28 同构架构：SQLite + 面板式 Bot）",
+  "main": "src/index.js",
+  "license": "ISC",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^16.4.5",
+    "telegraf": "^4.16.3",
+    "telegram": "^2.26.16"
+  }
+}
