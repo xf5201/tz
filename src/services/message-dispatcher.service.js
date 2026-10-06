@@ -142,16 +142,28 @@ class MessageDispatcherService {
       }
       const before = accountDao.getActive(balanceOwner);
       const wasDepleted = before && before.balance != null && Number(before.balance) <= 0;
+
+      // 主动查询即「初始化余额」：查到的余额同时写入当前余额与初始余额
+      // （用户点「🔍 初始化余额」就是要以此刻的余额作为起点）
       accountDao.updateBalance(balanceOwner, jiba);
+      accountDao.setInitialBalance(balanceOwner, jiba);
       logger.info(
-        `[DISPATCH] 余额查询更新: 用户=${balanceOwner}, 群=${maskChatId(chatId)}, JIBA=${jiba}`
+        `[DISPATCH] 余额查询更新: 用户=${balanceOwner}, 群=${maskChatId(chatId)}, JIBA=${jiba}` +
+        `（已设为初始余额）`
       );
 
-      // 余额从「见底」恢复 → 通知用户已自动恢复下注
-      if (wasDepleted && jiba > 0 && this.strategyExecutor) {
-        await this.strategyExecutor.notifyBalanceRestored(balanceOwner, jiba).catch((err) =>
-          logger.error(`[DISPATCH] notifyBalanceRestored 异常: ${err.message}`)
-        );
+      if (this.strategyExecutor) {
+        // 余额从「见底」恢复 → 通知已自动恢复下注
+        if (wasDepleted && jiba > 0) {
+          await this.strategyExecutor.notifyBalanceRestored(balanceOwner, jiba).catch((err) =>
+            logger.error(`[DISPATCH] notifyBalanceRestored 异常: ${err.message}`)
+          );
+        } else {
+          // 否则告知初始化完成（初始余额已更新）
+          await this.strategyExecutor.notifyBalanceInitialized(balanceOwner, jiba).catch((err) =>
+            logger.error(`[DISPATCH] notifyBalanceInitialized 异常: ${err.message}`)
+          );
+        }
       }
       return;
     }

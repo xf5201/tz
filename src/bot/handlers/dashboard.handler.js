@@ -133,13 +133,17 @@ class DashboardHandler {
     }
 
     const enabled = account.alert_enabled ? 0 : 1;
-    accountDao.setAlertEnabled(botUserId, enabled);
 
-    // 首次开启时若还没有基准，用当前余额作为基准
-    if (enabled === 1 && (account.initial_balance == null || Number(account.initial_balance) <= 0)
-        && account.balance != null) {
-      accountDao.setInitialBalance(botUserId, account.balance);
+    // 开启预警必须有基准：初始余额只能由「🔍 初始化余额」确定，
+    // 不能拿当前余额凑数（那是个随机时刻的值，当基准没意义）
+    if (enabled === 1
+        && (account.initial_balance == null || Number(account.initial_balance) <= 0)) {
+      logger.warn(`[DASHBOARD] 用户 ${botUserId} 未初始化余额，无法开启亏损预警`);
+      await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+      return;
     }
+
+    accountDao.setAlertEnabled(botUserId, enabled);
 
     operationLogDao.insert({
       bot_user_id: botUserId,

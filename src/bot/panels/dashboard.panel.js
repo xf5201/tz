@@ -57,6 +57,8 @@ class DashboardPanel {
         if (account.alert_enabled === 1 && balance < initial / 2) {
           text += '📉 已跌破初始余额一半，注意风险\n';
         }
+      } else {
+        text += '🎯 初始余额：未设置（点「🔍 初始化余额」记录起点）\n';
       }
     } else {
       text += '💳 当前余额：—（等待下注回复）\n';
@@ -147,23 +149,18 @@ class DashboardPanel {
         'dashboard:take_profit'
       )]);
 
-      // 亏损预警：开关 + 基准重置
-      // 亏损超过初始余额一半时主动发消息告警（需余额已解析到才有意义）
+      // 亏损预警开关：当前余额跌破初始余额一半时主动发消息告警
+      // （需先点「🔍 初始化余额」设好基准才有意义）
       if (account.balance != null) {
         buttons.push([Markup.button.callback(
           account.alert_enabled ? '📉 亏损预警：开（点击关闭）' : '📉 亏损预警：关（点击开启）',
           'dashboard:alert_toggle'
         )]);
-        if (account.alert_enabled) {
-          buttons.push([Markup.button.callback(
-            `🎯 重置亏损基准（当前 ${formatNumber(account.balance)}）`,
-            'dashboard:alert_reset'
-          )]);
-        }
       }
 
-      // 主动查余额：往群里发「余额」问一次（充值后不用重启就能恢复）
-      buttons.push([Markup.button.callback('🔍 查询余额', 'dashboard:query_balance')]);
+      // 初始化余额：往群里发「余额」问一次，查到的余额即记为初始余额
+      // （同时用于：充值后刷新余额、亏损预警的基准）
+      buttons.push([Markup.button.callback('🔍 初始化余额', 'dashboard:query_balance')]);
 
       buttons.push([Markup.button.callback('🗑️ 删除账号', 'account:delete_confirm')]);
     }

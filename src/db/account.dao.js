@@ -97,8 +97,8 @@ const accountDao = {
   /**
    * 写入当前余额（由机器人对本账号下注的回复消息解析得到）
    *
-   * 首次写入时把该余额自动记为「初始余额」（亏损基准），
-   * 之后不再变动，除非用户在面板手动重置基准。
+   * 只更新「当前余额」，不动初始余额 —— 初始余额只能由用户点
+   * 「🔍 初始化余额」主动查询来确定，避免用一次随机余额当基准。
    *
    * @param {string} botUserId
    * @param {number} balance
@@ -107,18 +107,19 @@ const accountDao = {
     const db = getConnection();
     db.prepare(`
       UPDATE accounts
-      SET balance = ?,
-          balance_updated_at = datetime('now', '+8 hours'),
-          initial_balance = COALESCE(initial_balance, ?)
+      SET balance = ?, balance_updated_at = datetime('now', '+8 hours')
       WHERE bot_user_id = ?
-    `).run(balance, balance, String(botUserId));
+    `).run(balance, String(botUserId));
   },
 
   /**
-   * 重置亏损基准（把当前余额设为初始余额）
+   * 设置初始余额（亏损基准）
+   *
+   * 由「🔍 初始化余额」调用：查询到的余额同时写入当前余额与初始余额。
+   * 设置后清除告警标记，允许重新告警。
    *
    * @param {string} botUserId
-   * @param {number} balance - 新的基准值（通常传当前余额）
+   * @param {number} balance
    */
   setInitialBalance(botUserId, balance) {
     const db = getConnection();

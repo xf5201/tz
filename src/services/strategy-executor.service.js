@@ -746,6 +746,30 @@ class StrategyExecutorService {
   }
 
   /**
+   * 余额初始化完成通知（用户点「🔍 初始化余额」后）
+   *
+   * @param {string} botUserId
+   * @param {number} balance - 查询到的余额（已写入当前余额与初始余额）
+   */
+  async notifyBalanceInitialized(botUserId, balance) {
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: 'BALANCE_INITIALIZED',
+      detail: `余额初始化完成：${balance}（已设为初始余额）`,
+    });
+    logger.info(`[STRATEGY_EXEC] 余额初始化: 用户=${botUserId}, 余额=${balance}`);
+
+    if (this.notification) {
+      await this.notification.notifyEvent(
+        botUserId,
+        `✅ <b>余额初始化完成</b>\n当前余额：${balance}\n` +
+        `已记录为初始余额，亏损预警以此为基准。`
+      ).catch(() => {});
+      await this.notification.pushToUser(botUserId).catch(() => {});
+    }
+  }
+
+  /**
    * 余额从「见底」恢复的通知（充值后自动继续，无需人工启用规则）
    *
    * @param {string} botUserId
