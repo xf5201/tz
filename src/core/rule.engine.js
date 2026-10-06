@@ -130,6 +130,53 @@ function buildBetText(direction, amount) {
 }
 
 /**
+ * 余额停注门槛（.env BALANCE_FLOOR，默认 0）
+ * 余额 <= 该值即视为「没钱」，全局停注
+ */
+function balanceFloor() {
+  const n = parseFloat(process.env.BALANCE_FLOOR);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * 启用中规则里最小的单注金额（0 = 没有启用规则）
+ *
+ * 用途：余额连最便宜的一注都买不起时，没必要再发指令去撞
+ * 「❌ 余额不足」的墙，直接停注更干净。
+ *
+ * @param {Array} rules
+ * @returns {number}
+ */
+function minBaseBet(rules) {
+  const bases = (rules || [])
+    .filter((r) => r.enabled === 1)
+    .map((r) => Number(r.base_bet))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  return bases.length ? Math.min(...bases) : 0;
+}
+
+/**
+ * 余额是否不足以继续下注
+ *
+ * 两条判定（任一成立即停注）：
+ *   1. 余额 <= BALANCE_FLOOR（默认 0）：余额归零 / 为负
+ *   2. 余额 < 最小单注金额：连最便宜的一注都买不起
+ * 从未解析到余额（null）时一律返回 false —— 消息格式一变就让整套规则
+ * 静默罢工是最危险的行为，宁可照常下注后被机器人拒绝。
+ *
+ * @param {number|null|undefined} balance
+ * @param {Array} rules - 启用中的规则（用于取最小单注）
+ * @returns {boolean}
+ */
+function isBalanceInsufficient(balance, rules) {
+  if (balance == null || !Number.isFinite(Number(balance))) return false;
+  const b = Number(balance);
+  if (b <= balanceFloor()) return true;
+  const minBet = minBaseBet(rules);
+  return minBet > 0 && b < minBet;
+}
+
+/**
  * 生成规则的可读描述
  */
 function describeRule(rule) {
@@ -144,4 +191,7 @@ module.exports = {
   calcCumulativeStake,
   buildBetText,
   describeRule,
+  balanceFloor,
+  minBaseBet,
+  isBalanceInsufficient,
 };

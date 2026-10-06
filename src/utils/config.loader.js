@@ -20,6 +20,7 @@ const fs = require('fs');
  *   DICE_POLL_INTERVAL_MS  - 开奖轮询间隔（默认 5000）
  *   LOG_CONSOLE            - 日志是否打印到终端（默认 false，只写日志文件）
  *   BALANCE_NICKNAME       - 本账号在群里的下注昵称（可选，余额播报归属二次校验）
+ *   BALANCE_FLOOR          - 余额停注门槛（默认 0，余额 <= 该值全局停注）
  */
 
 // 加载 .env（如果存在）
@@ -52,6 +53,8 @@ const DEFAULTS = {
   LOG_CONSOLE: 'false',
   // 本账号在群里下注时显示的昵称（可选）：余额播报里必须出现它才认领余额
   BALANCE_NICKNAME: '',
+  // 余额停注门槛：余额 <= 该值时全局停注
+  BALANCE_FLOOR: '0',
 };
 
 /**
@@ -105,6 +108,10 @@ function loadConfig() {
   logConsole: String(process.env.LOG_CONSOLE || DEFAULTS.LOG_CONSOLE).toLowerCase() === 'true',
   // 余额播报昵称校验（空 = 不校验，仅靠 reply 归属）
   balanceNickname: (process.env.BALANCE_NICKNAME || DEFAULTS.BALANCE_NICKNAME).trim(),
+  // 余额停注门槛：余额 <= 该值全局停注（默认 0）
+  balanceFloor: Number.isFinite(parseFloat(process.env.BALANCE_FLOOR))
+    ? parseFloat(process.env.BALANCE_FLOOR)
+    : parseFloat(DEFAULTS.BALANCE_FLOOR),
 };
 
   // 校验 TG_API_ID 为数字

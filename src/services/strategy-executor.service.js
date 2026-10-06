@@ -7,9 +7,12 @@ const actionLogDao = require('../db/action-log.dao');
 const operationLogDao = require('../db/operation-log.dao');
 const { transaction } = require('../db/connection');
 const {
-  evaluateStreak, calcAmount, calcCumulativeStake, buildBetText,
+  evaluateStreak, calcAmount, calcCumulativeStake, buildBetText, isBalanceInsufficient,
 } = require('../core/rule.engine');
 const { parseSettle } = require('../core/dice.parser');
+const {
+  calcRoundProfit, isTakeProfitReached, isBaselineStale, beijingDate,
+} = require('../core/profit.guard');
 const logger = require('../utils/logger');
 const { maskChatId } = require('../utils/mask.util');
 
@@ -89,8 +92,14 @@ class StrategyExecutorService {
     const account = accountDao.getActive(botUserId);
     if (!account || account.status !== 'ACTIVE') return;
 
+    // 今日已达标止盈 → 停止运行，等用户手动恢复
+    if (account.profit_stopped === 1) return;
+
     const rules = ruleDao.listEnabledByUser(botUserId);
     if (rules.length === 0) return;
+
+    // 余额见底 → 不再进入待发（省得待发后又因余额不足被拒）
+    if (this.isBalanceDepleted(account, rules)) return;
 
     const armedRules = [];
     const resumedChats = [];
@@ -158,8 +167,19 @@ class StrategyExecutorService {
     const account = accountDao.getActive(botUserId);
     if (!account || account.status !== 'ACTIVE') return;
 
+    // 今日已达标止盈 → 不再下注，等用户手动恢复
+    if (account.profit_stopped === 1) return;
+
     const rules = ruleDao.listEnabledByUser(botUserId);
     if (rules.length === 0) return;
+
+    // 余额见底 → 全局停注（不再下任何一注）
+    if (this.isBalanceDepleted(account, rules)) {
+      logger.info(
+        `[STRATEGY_EXEC] 余额 ${account.balance} 不足，全局停注跳过本轮: 群=${maskChatId(chatId)}`
+      );
+      return;
+    }
 
     const candidates = [];
 
@@ -407,6 +427,8 @@ class StrategyExecutorService {
         state = ruleStateDao.ensure(rule.id, chatId);
         // 已停注的群：结算完就好，不再进入下一轮待发
         if (state.blocked) continue;
+        // 已止盈停止 / 余额不足：本笔结算照常完成，但不再进入下一轮待发
+        if (account.profit_stopped === 1 || this.isBalanceDepleted(account, rules)) continue;
         if (settle.diceValue != null && !state.armed_direction && !state.pending_direction) {
           this._tryArm(botUserId, rule, chatId, settle.diceValue, armedRules);
         }
@@ -431,6 +453,13 @@ class StrategyExecutorService {
           `规则继续在其它群运行；本群等连击中断后重新触发即自动恢复（连败清零）。`
         ).catch(() => {});
       }
+    }
+
+    // 结算会让今日盈利变化 → 每次结算后检查是否达到止盈目标
+    if (settledCount > 0) {
+      await this.checkTakeProfit(botUserId).catch((err) => logger.error(
+        `[STRATEGY_EXEC] checkTakeProfit 异常: 用户=${botUserId}, ${err.message}`
+      ));
     }
 
     if ((settledCount > 0 || armedRules.length > 0 || blockedChats.length > 0) && this.notification) {
@@ -596,6 +625,223 @@ class StrategyExecutorService {
    */
   resetRuleState(ruleId) {
     ruleStateDao.resetByRule(ruleId);
+  }
+
+  /**
+   * 余额是否低到必须全局停注（所有规则都不再下注）
+   *
+   * 判定见 core/rule.engine.isBalanceInsufficient：
+   *   余额 <= BALANCE_FLOOR（默认 0），或连最便宜的一注都买不起 → 停注。
+   * 从未解析到余额（null）时不停注，避免消息格式一变整套规则静默罢工。
+   * 余额恢复（充值）后自动继续，无需人工重新启用规则。
+   *
+   * @param {object|null} account
+   * @param {Array} rules - 启用中的规则
+   * @returns {boolean}
+   */
+  isBalanceDepleted(account, rules = []) {
+    if (!account) return false;
+    return isBalanceInsufficient(account.balance, rules);
+  }
+
+  /**
+   * 下注被机器人拒绝（余额不足 / 指令不合法等）
+   *
+   * 这笔注根本没投出去，因此：
+   *   1. 动作记录标记 FAILED（不给输赢、不算连败）
+   *   2. 必须立刻清掉挂起 —— 否则群里再来多少开奖都等不到这笔的结算，
+   *      该「规则 × 群」永久卡死
+   *   3. 通知用户（余额不足多半需要充值）
+   *
+   * @param {string} botUserId
+   * @param {string} chatId
+   * @param {object} bet - action_logs 行
+   * @param {string|null} reason - 机器人给的失败原因
+   */
+  async handleBetRejected(botUserId, chatId, bet, reason) {
+    const changed = actionLogDao.markRejected(bet.id, reason || '下注被机器人拒绝');
+
+    // 清挂起：pending 正是这一笔才清（可能已被后续开奖结算，那时 changed=0 就不动）
+    if (changed > 0 && bet.rule_id != null) {
+      transaction(() => ruleStateDao.updateState(bet.rule_id, chatId, { pendingDirection: null }));
+    }
+
+    const detail = `下注「${bet.action_text}」被拒绝：${reason || '未知原因'}（未投出，不计连败）`;
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: 'BET_REJECTED',
+      detail: `${detail}｜群 ${maskChatId(chatId)}`,
+    });
+    logger.warn(`[STRATEGY_EXEC] 下注被拒: 用户=${botUserId}, 群=${maskChatId(chatId)}, ${detail}`);
+
+    if (this.notification) {
+      await this.notification.notifyEvent(
+        botUserId,
+        `⚠️ 群 ${maskChatId(chatId)} 下注「${bet.action_text}」被拒绝：${reason || '未知原因'}\n` +
+        '该注未投出，不计入连败，挂起已解除。\n' +
+        '常见原因是余额不足，请充值后自动恢复。'
+      ).catch(() => {});
+      await this.notification.pushToUser(botUserId).catch(() => {});
+    }
+  }
+
+  /**
+   * 余额更新后的告警检查（亏损过半 / 余额见底）
+   *
+   * 由消息分发器在写入余额后调用：
+   *   - 亏损超过初始余额一半 → 告警（同一轮只告警一次，余额回升后重新武装）
+   *   - 余额低于门槛 → 全局停注告警
+   *
+   * @param {string} botUserId
+   * @returns {Promise<void>}
+   */
+  async checkBalanceAlerts(botUserId) {
+    const account = accountDao.getActive(botUserId);
+    if (!account || account.balance == null) return;
+
+    const balance = Number(account.balance);
+
+    // ① 亏损过半预警（需用户在面板开启）
+    if (account.alert_enabled === 1 && account.initial_balance != null) {
+      const initial = Number(account.initial_balance);
+      const threshold = initial / 2;
+      if (initial > 0 && balance < threshold) {
+        if (!account.alert_notified_at) {
+          const lost = initial - balance;
+          const pct = ((lost / initial) * 100).toFixed(1);
+          accountDao.markAlertNotified(botUserId);
+          operationLogDao.insert({
+            bot_user_id: botUserId,
+            action: 'BALANCE_HALF_LOSS_ALERT',
+            detail: `亏损已达初始余额一半：初始 ${initial} → 当前 ${balance}（亏 ${lost}，${pct}%）`,
+          });
+          logger.warn(`[STRATEGY_EXEC] 亏损过半告警: 用户=${botUserId}, ${initial} → ${balance}`);
+          if (this.notification) {
+            await this.notification.notifyEvent(
+              botUserId,
+              `📉 <b>亏损预警</b>\n` +
+              `初始余额：${initial}\n当前余额：${balance}\n` +
+              `已亏损：${lost}（${pct}%）\n` +
+              `已跌破初始余额的一半，建议暂停策略并复核参数。`
+            ).catch(() => {});
+          }
+        }
+      } else if (account.alert_notified_at) {
+        // 回到阈值以上 → 清除标记，下次回落可再次告警
+        accountDao.clearAlertNotified(botUserId);
+      }
+    }
+
+    // ② 余额见底 → 全局停注
+    if (this.isBalanceDepleted(account, ruleDao.listEnabledByUser(botUserId))) {
+      logger.warn(`[STRATEGY_EXEC] 余额已见底，全局停注: 用户=${botUserId}, 余额=${balance}`);
+      if (this.notification) {
+        await this.notification.notifyEvent(
+          botUserId,
+          `🛑 <b>余额不足，已全局停注</b>\n当前余额：${balance}\n` +
+          '全部规则暂停下注，充值后自动恢复（无需重新启用规则）。'
+        ).catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * 今日盈利（北京时间 00:00 起的已结算盈亏合计）
+   * @param {string} botUserId
+   * @returns {number}
+   */
+  getTodayProfit(botUserId) {
+    const shifted = new Date(Date.now() + 8 * 3600 * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    const midnight = `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} 00:00:00`;
+    return Math.round(actionLogDao.sumProfit(botUserId, midnight) * 100) / 100;
+  }
+
+  /**
+   * 本轮盈利（用于止盈判定）= 今日总盈利 − 基准
+   * @param {object} account
+   * @returns {number}
+   */
+  getRoundProfit(account) {
+    return calcRoundProfit(this.getTodayProfit(account.bot_user_id), account.profit_baseline);
+  }
+
+  /**
+   * 止盈检查：本轮盈利达到目标 → 全局停止运行，等用户手动恢复
+   *
+   * 只在「盈利」达标时触发，亏钱永远不停。
+   * 跨天自动重置基准与停止状态（新的一天重新开始）。
+   *
+   * @param {string} botUserId
+   * @returns {Promise<boolean>} 本次是否触发了停止
+   */
+  async checkTakeProfit(botUserId) {
+    const account = accountDao.getActive(botUserId);
+    if (!account) return false;
+
+    // 跨天 → 基准作废，本轮盈利重新从 0 起算，停止状态一并解除
+    if (isBaselineStale(account.profit_baseline_date)) {
+      accountDao.resetProfitBaseline(botUserId);
+      logger.info(`[STRATEGY_EXEC] 新的一天，止盈基准已重置: 用户=${botUserId}`);
+      return false;
+    }
+
+    if (account.profit_stopped === 1) return false; // 已停，等手动恢复
+    if (account.take_profit == null) return false;  // 未启用止盈
+
+    const roundProfit = this.getRoundProfit(account);
+    if (!isTakeProfitReached(roundProfit, account.take_profit)) return false;
+
+    accountDao.markProfitStopped(botUserId);
+    // 待发不会被消费了，直接清掉（挂起保留：已投出去的注还要等结算）
+    ruleStateDao.clearArmedByUser(botUserId);
+    const todayProfit = this.getTodayProfit(botUserId);
+
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: 'TAKE_PROFIT_STOPPED',
+      detail: `本轮盈利 ${roundProfit} 已达止盈目标 ${account.take_profit}，停止运行（今日总盈利 ${todayProfit}）`,
+    });
+    logger.warn(
+      `[STRATEGY_EXEC] 止盈停止: 用户=${botUserId}, 本轮盈利=${roundProfit}, ` +
+      `目标=${account.take_profit}, 今日总盈利=${todayProfit}`
+    );
+
+    if (this.notification) {
+      await this.notification.notifyEvent(
+        botUserId,
+        `🎯 <b>已达标止盈，停止运行</b>\n` +
+        `本轮盈利：${roundProfit}（目标 ${account.take_profit}）\n` +
+        `今日总盈利：${todayProfit}（保留，不受影响）\n\n` +
+        `全部规则已停止下注。\n到主面板点「▶️ 恢复运行」才会继续（恢复后本轮盈利清零重新计算）。`
+      ).catch(() => {});
+      await this.notification.pushToUser(botUserId).catch(() => {});
+    }
+    return true;
+  }
+
+  /**
+   * 恢复运行（用户手动触发）：解除止盈停止，本轮盈利清零重新计算
+   *
+   * 关键：清的是「本轮盈利」——做法是把基准拉到当前的今日总盈利。
+   * 今日总盈利本身由一条条下注记录累计而来，完全不受影响。
+   *
+   * @param {string} botUserId
+   * @returns {Promise<number>} 重置后的本轮盈利（应为 0）
+   */
+  async resumeFromTakeProfit(botUserId) {
+    const todayProfit = this.getTodayProfit(botUserId);
+    accountDao.resumeFromProfitStop(botUserId, todayProfit);
+
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: 'TAKE_PROFIT_RESUMED',
+      detail: `手动恢复运行，本轮盈利清零（基准设为今日总盈利 ${todayProfit}，今日总盈利不受影响）`,
+    });
+    logger.info(
+      `[STRATEGY_EXEC] 止盈后手动恢复: 用户=${botUserId}, 基准=${todayProfit}`
+    );
+    return 0;
   }
 
   /**

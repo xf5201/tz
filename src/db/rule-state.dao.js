@@ -109,6 +109,25 @@ const ruleStateDao = {
   },
 
   /**
+   * 清掉某用户全部「待发」标记（保留挂起，挂起的注还要等结算）
+   *
+   * 用于止盈停止 / 余额耗尽等全局停止：待发不会被消费，与其等 3 分钟
+   * 超时自愈，不如立刻清掉，恢复运行时从干净状态开始。
+   *
+   * @param {string} botUserId
+   * @returns {number} 清理的行数
+   */
+  clearArmedByUser(botUserId) {
+    const db = getConnection();
+    return db.prepare(`
+      UPDATE rule_chat_state
+      SET armed_direction = NULL, updated_at = datetime('now', '+8 hours')
+      WHERE armed_direction IS NOT NULL
+        AND rule_id IN (SELECT id FROM rules WHERE bot_user_id = ?)
+    `).run(String(botUserId)).changes;
+  },
+
+  /**
    * 用户全部被停注的「规则 × 群」（面板展示 / 人工恢复）
    *
    * @param {string} botUserId

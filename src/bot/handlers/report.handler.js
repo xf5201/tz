@@ -1,5 +1,6 @@
 // src/bot/handlers/report.handler.js
 const actionLogDao = require('../../db/action-log.dao');
+const accountDao = require('../../db/account.dao');
 const operationLogDao = require('../../db/operation-log.dao');
 const logger = require('../../utils/logger');
 
@@ -16,7 +17,7 @@ const logger = require('../../utils/logger');
 const PAGE_SIZE = 10;
 
 class ReportHandler {
-  static async handle(ctx, action, params, { panelRenderer }) {
+  static async handle(ctx, action, params, { panelRenderer, services }) {
     const botUserId = String(ctx.from.id);
 
     switch (action) {
@@ -29,11 +30,11 @@ class ReportHandler {
         break;
 
       case 'clear_today':
-        await this.renderClearConfirm(ctx, botUserId, { panelRenderer });
+        await this.renderClearConfirm(ctx, botUserId, { panelRenderer, services });
         break;
 
       case 'clear_today_do':
-        await this.handleClearToday(ctx, botUserId, { panelRenderer });
+        await this.handleClearToday(ctx, botUserId, { panelRenderer, services });
         break;
 
       case 'noop':
@@ -44,12 +45,27 @@ class ReportHandler {
     }
   }
 
-  static async render(ctx, botUserId, page, { panelRenderer }) {
+  /**
+   * 下注记录面板数据（列表 / 清空后复用）
+   */
+  static collectData(botUserId, page, services) {
     page = Math.max(0, page);
     const midnight = this._beijingMidnight();
+    const todayProfit = round2(actionLogDao.sumProfit(botUserId, midnight));
 
-    await panelRenderer.render(ctx, 'report', {
-      todayProfit: round2(actionLogDao.sumProfit(botUserId, midnight)),
+    // 本轮盈利（止盈判定用）：今日总盈利 − 基准
+    let roundProfit = null;
+    let takeProfit = null;
+    if (services && services.strategyExecutor) {
+      const account = accountDao.getActive(botUserId);
+      if (account && account.take_profit != null) {
+        takeProfit = account.take_profit;
+        roundProfit = services.strategyExecutor.getRoundProfit(account);
+      }
+    }
+
+    return {
+      todayProfit,
       bets: actionLogDao.listByUser(botUserId, {
         limit: PAGE_SIZE,
         offset: page * PAGE_SIZE,
@@ -57,24 +73,24 @@ class ReportHandler {
       page,
       total: actionLogDao.countByUser(botUserId),
       todayCount: actionLogDao.countSince(botUserId, midnight),
-    });
+      roundProfit,
+      takeProfit,
+    };
+  }
+
+  static async render(ctx, botUserId, page, { panelRenderer, services }) {
+    await panelRenderer.render(ctx, 'report', this.collectData(botUserId, page, services));
   }
 
   /**
    * 清空今日确认框
    */
-  static async renderClearConfirm(ctx, botUserId, { panelRenderer }) {
+  static async renderClearConfirm(ctx, botUserId, { panelRenderer, services }) {
     const midnight = this._beijingMidnight();
     const count = actionLogDao.countSince(botUserId, midnight);
 
     if (count === 0) {
-      await panelRenderer.render(ctx, 'report', {
-        todayProfit: 0,
-        bets: actionLogDao.listByUser(botUserId, { limit: PAGE_SIZE, offset: 0 }),
-        page: 0,
-        total: actionLogDao.countByUser(botUserId),
-        todayCount: 0,
-      });
+      await panelRenderer.render(ctx, 'report', this.collectData(botUserId, 0, services));
       return;
     }
 
@@ -92,7 +108,7 @@ class ReportHandler {
   /**
    * 执行清空今日记录
    */
-  static async handleClearToday(ctx, botUserId, { panelRenderer }) {
+  static async handleClearToday(ctx, botUserId, { panelRenderer, services }) {
     const midnight = this._beijingMidnight();
     const removed = actionLogDao.deleteSince(botUserId, midnight);
     // 记录已删，挂起 / 待发标记必须一起清，否则执行器会反复自愈告警
@@ -105,13 +121,7 @@ class ReportHandler {
     });
     logger.info(`[REPORT] 用户 ${botUserId} 清空今日记录 ${removed} 条`);
 
-    await panelRenderer.render(ctx, 'report', {
-      todayProfit: 0,
-      bets: actionLogDao.listByUser(botUserId, { limit: PAGE_SIZE, offset: 0 }),
-      page: 0,
-      total: actionLogDao.countByUser(botUserId),
-      todayCount: 0,
-    });
+    await panelRenderer.render(ctx, 'report', this.collectData(botUserId, 0, services));
   }
 
   /**

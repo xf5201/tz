@@ -34,6 +34,21 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- 当前余额：由「下注后机器人回复的余额消息」解析写入（只认本账号自己的回复）
     balance        REAL NULL,
     balance_updated_at DATETIME NULL,
+    -- 初始余额（亏损基准）：首次解析到余额时自动记录，也可在面板手动重置
+    initial_balance REAL NULL,
+    -- 亏损预警开关：亏损超过初始余额一半时告警（0关 1开）
+    alert_enabled  INTEGER NOT NULL DEFAULT 0 CHECK(alert_enabled IN (0,1)),
+    -- 上次告警时间（防重复刷屏；余额回到阈值以上自动清空，回落再告警）
+    alert_notified_at DATETIME NULL,
+    -- 今日止盈目标：本轮盈利达到该值即全局停止（NULL = 不启用）
+    take_profit    REAL NULL,
+    -- 本轮盈利起点（当时的今日盈利快照）：本轮盈利 = 今日盈利 − 该基准
+    profit_baseline REAL NULL,
+    -- 基准所属日期（北京时区 YYYY-MM-DD）：跨天自动重置基准与停止状态
+    profit_baseline_date TEXT NULL,
+    -- 是否因达到止盈而停止：1 = 停（需用户手动恢复）
+    profit_stopped INTEGER NOT NULL DEFAULT 0 CHECK(profit_stopped IN (0,1)),
+    profit_stopped_at DATETIME NULL,
     created_at     DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     updated_at     DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     FOREIGN KEY (bot_user_id) REFERENCES bot_users(bot_user_id)

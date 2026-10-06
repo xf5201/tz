@@ -2,6 +2,9 @@
 const { Scenes } = require('telegraf');
 const panelContextDao = require('../../db/panel-context.dao');
 const monitoredChatDao = require('../../db/monitored-chat.dao');
+const accountDao = require('../../db/account.dao');
+const actionLogDao = require('../../db/action-log.dao');
+const operationLogDao = require('../../db/operation-log.dao');
 const logger = require('../../utils/logger');
 
 /**
@@ -109,6 +112,39 @@ const FIELD_CONFIG = {
     returnPanel: 'rule_wizard',
   },
 
+  // ── 主面板：今日止盈目标（直接写库，不走规则草稿）──
+  take_profit: {
+    label: '今日止盈目标',
+    prompt:
+      '请输入本轮盈利达到多少就停止运行（正数，例如：500、1000、5000）\n' +
+      '💡 输入 0 表示不启用止盈（永不自动停止）',
+    validate: (value) => {
+      const num = parseFloat(value);
+      if (isNaN(num)) return '请输入有效的数字';
+      if (num < 0) return '止盈目标不能为负数（输入 0 表示不启用）';
+      if (num > 100000000) return '止盈目标过大';
+      return null;
+    },
+    parse: (value) => parseFloat(value),
+    // 直接写 accounts，不走 wizard_state 草稿
+    directApply: (botUserId, value) => {
+      const todayProfit = beijingTodayProfit(botUserId);
+      // 0 → 视为「不启用」；同时把本轮盈利清零重新开始
+      accountDao.setTakeProfit(botUserId, value > 0 ? value : null, todayProfit);
+      accountDao.resumeFromProfitStop(botUserId, todayProfit);
+      operationLogDao.insert({
+        bot_user_id: botUserId,
+        action: value > 0 ? 'SET_TAKE_PROFIT' : 'CLEAR_TAKE_PROFIT',
+        detail: value > 0
+          ? `设置今日止盈目标 ${value}（本轮盈利从 0 起算）`
+          : '关闭今日止盈',
+      });
+      logger.info(`[INPUT_SCENE] 用户 ${botUserId} 止盈目标 = ${value > 0 ? value : '不启用'}`);
+    },
+    format: (value) => (value == null || value === '未设置' ? '未设置' : `${value}`),
+    returnPanel: 'dashboard',
+  },
+
   // ── 监听群：关键词搜索（更新 wizard_state.keyword）──
   chat_keyword: {
     label: '群名搜索',
@@ -200,7 +236,10 @@ const inputScene = new Scenes.WizardScene(
     const value = config.parse(input);
 
     try {
-      if (field === 'chat_keyword') {
+      if (config.directApply) {
+        // 直接落库的字段（如主面板的止盈目标），不走向导草稿
+        config.directApply(botUserId, value);
+      } else if (field === 'chat_keyword') {
         applyKeyword(botUserId, value);
       } else {
         // 写入规则向导草稿（wizard_state.draft）
@@ -241,6 +280,12 @@ const inputScene = new Scenes.WizardScene(
  * 读取字段当前值（向导草稿 / 搜索关键词）
  */
 function readCurrentValue(botUserId, field) {
+  // 直写库的字段（如止盈目标）从 accounts 读当前值
+  if (field === 'take_profit') {
+    const account = accountDao.getActive(botUserId);
+    return account && account.take_profit != null ? account.take_profit : '未设置';
+  }
+
   const panelCtx = panelContextDao.get(botUserId);
   if (!panelCtx || !panelCtx.wizard_state) return '未设置';
   try {
@@ -256,6 +301,18 @@ function readCurrentValue(botUserId, field) {
     }
   } catch (_) { /* 忽略 */ }
   return '未设置';
+}
+
+/**
+ * 北京时间今日 00:00 起的已结算盈亏合计（止盈基准用）
+ * @param {string} botUserId
+ * @returns {number}
+ */
+function beijingTodayProfit(botUserId) {
+  const shifted = new Date(Date.now() + 8 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  const midnight = `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} 00:00:00`;
+  return actionLogDao.sumProfit(botUserId, midnight);
 }
 
 /**
@@ -300,6 +357,13 @@ async function finish(ctx, botUserId, field, value) {
     return;
   }
 
+  // 直写库的字段（如止盈目标）→ 回主面板
+  if (config.returnPanel === 'dashboard') {
+    const DashboardHandler = require('../handlers/dashboard.handler');
+    await panelRenderer.render(ctx, 'dashboard', DashboardHandler.collectData(botUserId));
+    return;
+  }
+
   await panelRenderer.render(ctx, config.returnPanel, {
     draft: readDraft(botUserId),
     monitoredChats: monitoredChatDao.listByUser(botUserId),
@@ -316,7 +380,9 @@ function readDraft(botUserId) {
 }
 
 function cancelCallback(field) {
-  return field === 'chat_keyword' ? 'chat:main' : 'rule:w_back';
+  if (field === 'chat_keyword') return 'chat:main';
+  if (field === 'take_profit') return 'dashboard:refresh';
+  return 'rule:w_back';
 }
 
 // 超时处理：2 分钟无操作自动退出

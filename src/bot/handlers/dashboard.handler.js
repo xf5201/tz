@@ -7,6 +7,7 @@ const messageLogDao = require('../../db/message-log.dao');
 const actionLogDao = require('../../db/action-log.dao');
 const operationLogDao = require('../../db/operation-log.dao');
 const logger = require('../../utils/logger');
+const { calcRoundProfit, isBaselineStale } = require('../../core/profit.guard');
 
 /**
  * 主面板回调处理
@@ -26,6 +27,23 @@ class DashboardHandler {
 
       case 'resume_chats':
         await this.handleResumeChats(ctx, botUserId, { panelRenderer, services });
+        break;
+
+      case 'alert_toggle':
+        await this.handleAlertToggle(ctx, botUserId, { panelRenderer });
+        break;
+
+      case 'alert_reset':
+        await this.handleAlertReset(ctx, botUserId, { panelRenderer });
+        break;
+
+      case 'take_profit':
+        // 进入自定义输入：输入目标金额；输入 0 = 关闭止盈
+        await ctx.scene.enter('input', { field: 'take_profit' });
+        break;
+
+      case 'resume_profit':
+        await this.handleResumeProfit(ctx, botUserId, { panelRenderer, services });
         break;
 
       default:
@@ -61,6 +79,13 @@ class DashboardHandler {
       chat_title: titleByChat[String(b.chat_id)] || null,
     }));
 
+    // 本轮盈利（止盈判定用）：今日总盈利 − 基准；跨天则基准作废，从头算
+    let roundProfit = null;
+    if (account) {
+      const baseline = isBaselineStale(account.profit_baseline_date) ? 0 : account.profit_baseline;
+      roundProfit = calcRoundProfit(todayProfit, baseline);
+    }
+
     return {
       user: { id: botUserId },
       account,
@@ -70,6 +95,7 @@ class DashboardHandler {
       todayProfit,
       latestFailed,
       blockedChats,
+      roundProfit,
     };
   }
 
@@ -89,6 +115,72 @@ class DashboardHandler {
         detail: `主面板人工恢复 ${n} 个停注群`,
       });
     }
+    await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+  }
+
+  /**
+   * 亏损预警开关：开启后，当前余额跌破初始余额一半时主动发消息告警
+   */
+  static async handleAlertToggle(ctx, botUserId, { panelRenderer }) {
+    const account = accountDao.getActive(botUserId);
+    if (!account) {
+      await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+      return;
+    }
+
+    const enabled = account.alert_enabled ? 0 : 1;
+    accountDao.setAlertEnabled(botUserId, enabled);
+
+    // 首次开启时若还没有基准，用当前余额作为基准
+    if (enabled === 1 && (account.initial_balance == null || Number(account.initial_balance) <= 0)
+        && account.balance != null) {
+      accountDao.setInitialBalance(botUserId, account.balance);
+    }
+
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: enabled ? 'ENABLE_LOSS_ALERT' : 'DISABLE_LOSS_ALERT',
+      detail: enabled
+        ? `开启亏损预警（基准 ${account.initial_balance ?? account.balance}，跌破一半告警）`
+        : '关闭亏损预警',
+    });
+
+    await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+  }
+
+  /**
+   * 重置亏损基准：把当前余额设为新的初始余额
+   * （充值后或想重新开始统计时使用，重置后告警重新武装）
+   */
+  static async handleAlertReset(ctx, botUserId, { panelRenderer }) {
+    const account = accountDao.getActive(botUserId);
+    if (!account || account.balance == null) {
+      await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+      return;
+    }
+
+    accountDao.setInitialBalance(botUserId, account.balance);
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: 'RESET_LOSS_BASELINE',
+      detail: `重置亏损基准为当前余额 ${account.balance}`,
+    });
+
+    await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+  }
+
+  /**
+   * 恢复运行（达到止盈后由用户手动触发）
+   *
+   * 只清「本轮盈利」，今日总盈利不动 —— 它是实打实的下注记录累计出来的。
+   */
+  static async handleResumeProfit(ctx, botUserId, { panelRenderer, services }) {
+    if (!services || !services.strategyExecutor) {
+      await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+      return;
+    }
+
+    await services.strategyExecutor.resumeFromTakeProfit(botUserId);
     await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
   }
 }

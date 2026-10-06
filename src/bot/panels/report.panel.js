@@ -1,6 +1,7 @@
 // src/bot/panels/report.panel.js
 const { Markup } = require('telegraf');
-const { escapeHtml } = require('../../utils/format.util');
+const { escapeHtml, shortTitle } = require('../../utils/format.util');
+const { maskChatId } = require('../../utils/mask.util');
 
 /**
  * 下注记录面板（ReportPanel）
@@ -15,7 +16,9 @@ class ReportPanel {
     return { text, keyboard };
   }
 
-  static buildText({ todayProfit, bets = [], page = 0, total = 0 }) {
+  static buildText({
+    todayProfit, bets = [], page = 0, total = 0, roundProfit = null, takeProfit = null,
+  }) {
     // 今日盈利（正绿负红，HTML 不支持颜色，用符号区分）
     const profitText = todayProfit > 0
       ? `🟢 +${todayProfit}`
@@ -26,7 +29,15 @@ class ReportPanel {
     let text = '📊 <b>下注记录</b>\n';
     text += '━━━━━━━━━━━━━━━━━━━━\n';
     text += `💰 今日盈利：<b>${profitText}</b>\n`;
-    text += `🎯 记录：${total} 条，第 ${page + 1} 页\n`;
+
+    // 本轮盈利（止盈判定用的那条线）：达到目标就停，手动恢复后清零重新算
+    if (takeProfit != null) {
+      const rp = Number(roundProfit) || 0;
+      const rpText = rp > 0 ? `🟢 +${rp}` : rp < 0 ? `🔴 ${rp}` : `${rp}`;
+      text += `🎯 本轮盈利：${rpText} / ${takeProfit}\n`;
+    }
+
+    text += `📋 记录：${total} 条，第 ${page + 1} 页\n`;
     text += '━━━━━━━━━━━━━━━━━━━━\n';
 
     if (bets.length === 0) {
@@ -47,12 +58,17 @@ class ReportPanel {
       } else if (b.is_win === 0) {
         result = `❌ 输 ${b.profit != null ? b.profit : ''}`.trim();
       } else if (b.status === 'FAILED') {
-        result = '⚠️ 发送失败';
+        // 失败优先展示机器人给的原因（如「余额不足」），没有则退回通用文案
+        result = b.error_msg
+          ? `⚠️ ${escapeHtml(b.error_msg)}`
+          : '⚠️ 发送失败';
       } else {
         result = '⏳ 待结算';
       }
 
-      text += `${time}　${escapeHtml(dir)} ${escapeHtml(String(b.bet_amount))}　${result}\n`;
+      // 群名只取前 3 个字（一行要塞时间/方向/金额/输赢，位置有限）
+      const chat = shortTitle(b.chat_title) || maskChatId(b.chat_id);
+      text += `${time}　${escapeHtml(chat)}｜${escapeHtml(dir)} ${escapeHtml(String(b.bet_amount))}　${result}\n`;
     }
 
     return text;

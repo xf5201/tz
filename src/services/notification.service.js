@@ -1,10 +1,7 @@
 // src/services/notification.service.js
-const accountDao = require('../db/account.dao');
-const monitoredChatDao = require('../db/monitored-chat.dao');
-const ruleDao = require('../db/rule.dao');
-const messageLogDao = require('../db/message-log.dao');
-const actionLogDao = require('../db/action-log.dao');
 const logger = require('../utils/logger');
+// 复用主面板的数据组装（余额 / 停注群 / 今日盈利），保证刷新与推送显示一致
+const DashboardHandler = require('../bot/handlers/dashboard.handler');
 
 /**
  * 用户通知服务
@@ -32,30 +29,17 @@ class NotificationService {
    * 推送主面板更新
    *
    * 仅当用户当前正在查看 dashboard 面板时才更新
+   * 数据与主面板「刷新」按钮完全一致（含余额、停注群、今日盈利）
    *
    * @param {string} botUserId
    */
   async pushToUser(botUserId) {
     try {
-      const account = accountDao.getActive(botUserId);
-      const chats = monitoredChatDao.listByUser(botUserId);
-      const rules = ruleDao.listByUser(botUserId);
-      const throughput = messageLogDao.countRecent(botUserId, 10);
-
-      // 今日盈利（今日已结算注的盈亏合计）
-      const shifted = new Date(Date.now() + 8 * 3600 * 1000);
-      const pad = (n) => String(n).padStart(2, '0');
-      const midnight = `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} 00:00:00`;
-      const todayProfit = Math.round(actionLogDao.sumProfit(botUserId, midnight) * 100) / 100;
-
-      await this.panelRenderer.pushUpdate(botUserId, 'dashboard', {
-        user: { id: botUserId },
-        account,
-        chats,
-        rules,
-        throughput,
-        todayProfit,
-      });
+      await this.panelRenderer.pushUpdate(
+        botUserId,
+        'dashboard',
+        DashboardHandler.collectData(botUserId)
+      );
     } catch (error) {
       logger.warn(`[NOTIFICATION] 推送面板失败: 用户=${botUserId}, ${error.message}`);
     }

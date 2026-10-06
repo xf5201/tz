@@ -90,10 +90,14 @@ const actionLogDao = {
    */
   listByUser(botUserId, { limit = 20, offset = 0 } = {}) {
     const db = getConnection();
+    // 带出群名（下注记录要显示「在哪个群下的」）：
+    // 群被取消勾选后 monitored_chats 里就没了，故用 LEFT JOIN + 回退到 ID 尾号
     return db.prepare(`
-      SELECT a.*, r.name AS rule_name
+      SELECT a.*, r.name AS rule_name, mc.chat_title
       FROM action_logs a
       LEFT JOIN rules r ON r.id = a.rule_id
+      LEFT JOIN monitored_chats mc
+        ON mc.bot_user_id = a.bot_user_id AND mc.chat_id = a.chat_id
       WHERE a.bot_user_id = ?
       ORDER BY a.created_at DESC, a.id DESC
       LIMIT ? OFFSET ?
@@ -225,6 +229,25 @@ const actionLogDao = {
           WHERE bot_user_id = ? AND profit IS NOT NULL
         `).get(String(botUserId));
     return row?.s ? Number(row.s) : 0;
+  },
+
+  /**
+   * 标记下注被机器人拒绝（余额不足等）
+   *
+   * 只在该笔「尚未结算」时生效：若已结算说明这笔注确实投出去了，
+   * 不能因为后续一条余额播报就把它改判失败。
+   *
+   * @param {number} id
+   * @param {string} errorMsg - 机器人给的失败原因
+   * @returns {number} 实际更新行数（0 = 已结算，跳过）
+   */
+  markRejected(id, errorMsg) {
+    const db = getConnection();
+    return db.prepare(`
+      UPDATE action_logs
+      SET status = 'FAILED', error_msg = ?, settled_at = datetime('now', '+8 hours')
+      WHERE id = ? AND settled_at IS NULL
+    `).run(String(errorMsg || '').slice(0, 500), id).changes;
   },
 
   /**

@@ -52,6 +52,22 @@ function formatNumber(n) {
 }
 
 /**
+ * 群名简写：取前 n 个字符（按 Unicode 码点切，emoji 不会被切成半个）
+ *
+ * 下注记录一行要塞时间/方向/金额/输赢，群名只能给很短的位置，
+ * 故只取前 3 个字，例如「可乐聊胜群」→「可乐聊」。
+ *
+ * @param {string|null} title
+ * @param {number} n - 保留字符数（默认 3）
+ * @returns {string} 空值返回空串
+ */
+function shortTitle(title, n = 3) {
+  if (!title) return '';
+  const chars = Array.from(String(title).trim());
+  return chars.slice(0, n).join('');
+}
+
+/**
  * 截断字符串
  * @param {string} str
  * @param {number} maxLength
@@ -81,6 +97,7 @@ module.exports = {
   formatDbTime,
   formatAmount,
   formatNumber,
+  shortTitle,
   truncate,
   escapeHtml,
 };

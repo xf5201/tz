@@ -6,7 +6,7 @@ const accountDao = require('../db/account.dao');
 const logger = require('../utils/logger');
 const { maskChatId } = require('../utils/mask.util');
 const {
-  parseDiceMessage, isSettleMessage, parseBalance, getReplyToMsgId,
+  parseDiceMessage, isSettleMessage, parseBalance, parseBetResult, getReplyToMsgId,
 } = require('../core/dice.parser');
 const { isBetWindowMessage } = require('./strategy-executor.service');
 const { get: getConfigValue } = require('../utils/config.loader');
@@ -75,8 +75,11 @@ class MessageDispatcherService {
     //        ③ 该账号正在监听本群（在 targets 里）
     // 任一条不满足 → 丢弃，绝不猜测（别人的余额绝不能记到自己账上）
     let balanceOwner = null;
+    let bet = null;
     if (kind === 'balance') {
-      balanceOwner = this._resolveBalanceOwner(message, chatId, targets);
+      const resolved = this._resolveBalanceOwner(message, chatId, targets);
+      balanceOwner = resolved ? resolved.owner : null;
+      bet = resolved ? resolved.bet : null;
       if (!balanceOwner) {
         logger.debug(
           `[DISPATCH] 余额播报无法归属本账号，已忽略: 群=${maskChatId(chatId)}, 消息=${message.id}`
@@ -123,6 +126,24 @@ class MessageDispatcherService {
       logger.info(
         `[DISPATCH] 余额更新: 用户=${balanceOwner}, 群=${maskChatId(chatId)}, 余额=${balance}`
       );
+
+      // 同一条回复同时表明投注成败：
+      //   ✅ 投注成功 → 正常，保留挂起等结算
+      //   ❌ 余额不足等 → 这笔根本没投出去，必须立刻作废，
+      //      否则会一直挂起等结算，把「规则 × 群」卡死
+      const result = parseBetResult(message.message);
+      if (!result.success && bet) {
+        await this.strategyExecutor.handleBetRejected(
+          balanceOwner, chatId, bet, result.reason
+        ).catch((err) => logger.error(
+          `[DISPATCH] handleBetRejected 异常: 用户=${balanceOwner}, ${err.message}`
+        ));
+      }
+
+      // 余额刷新后检查：亏损过半预警 / 余额见底停注
+      await this.strategyExecutor.checkBalanceAlerts(balanceOwner).catch((err) => logger.error(
+        `[DISPATCH] checkBalanceAlerts 异常: 用户=${balanceOwner}, ${err.message}`
+      ));
       return;
     }
 
@@ -146,7 +167,7 @@ class MessageDispatcherService {
    * @param {object} message
    * @param {string} chatId
    * @param {string[]} targets - 正在监听本群的账号
-   * @returns {string|null} 归属的 bot_user_id；无法归属返回 null
+   * @returns {{owner: string, bet: object}|null} 归属账号与该笔下注记录；无法归属返回 null
    */
   _resolveBalanceOwner(message, chatId, targets) {
     const replyToMsgId = getReplyToMsgId(message);
@@ -167,7 +188,7 @@ class MessageDispatcherService {
     }
     if (nickname && !String(message.message || '').includes(nickname)) return null;
 
-    return owner;
+    return { owner, bet };
   }
 }
 

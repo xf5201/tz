@@ -93,6 +93,40 @@ function parseBalance(text) {
 }
 
 /**
+ * 判定机器人对下注的回复是「投注成功」还是「失败」
+ *
+ * 成功样例（必须有 ✅ 投注成功）：
+ *   👤可乐❤️挂机胜率99%
+ *   🎲 期号: 7b0bcbb5b486e06df1cc8b444b6d5d09
+ *   小 -60 JIBA - ✅ 投注成功
+ *   💰余额：1165750.20 JIBA
+ *
+ * 失败样例（余额不足等）：
+ *   👤小花猫
+ *   🎲 期号: 14fb827e01619e74522477593920f279
+ *   ❌ 余额不足,总下注金额 5 JIBA 点我充值
+ *   💰余额：0.64 JIBA
+ *
+ * 判定规则：出现「❌」即失败；否则必须有「投注成功」才算成功。
+ * 两者都没有 → 判失败（宁可不下注，也不能把没投出去的注当成有效注）。
+ *
+ * @param {string|null} text
+ * @returns {{success: boolean, reason: string|null}}
+ */
+function parseBetResult(text) {
+  const raw = String(text || '');
+
+  if (raw.includes('❌')) {
+    const m = raw.match(/❌\s*([^\n，,。]{0,40})/);
+    return { success: false, reason: (m ? m[1] : '机器人拒绝').trim() || '机器人拒绝' };
+  }
+
+  if (raw.includes('投注成功')) return { success: true, reason: null };
+
+  return { success: false, reason: '回复中未出现「投注成功」' };
+}
+
+/**
  * 取消息所回复的那条消息 ID（GramJS 两种结构都兼容）
  *
  * 余额播报是机器人「回复我们的下注消息」发出来的，
@@ -160,5 +194,6 @@ module.exports = {
   parseSettle,
   isBalanceMessage,
   parseBalance,
+  parseBetResult,
   getReplyToMsgId,
 };
