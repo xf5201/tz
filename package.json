@@ -1,6 +1,6 @@
 {
   "name": "tg-monitor-bot",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "description": "TG 群骰子开奖监听与自动下注系统（pc28 同构架构：SQLite + 面板式 Bot）",
   "main": "src/index.js",
   "license": "ISC",
