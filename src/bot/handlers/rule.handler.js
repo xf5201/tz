@@ -48,6 +48,26 @@ class RuleHandler {
         await ctx.scene.enter('input', { field: 'streak' });
         break;
 
+      // ── 其余数值项的「🔢 自定义输入」按钮 ──
+      // 面板生成的 callback 是 rule:w_{kind}_custom（下划线），
+      // 原来只注册了 w_streak_custom 一个 case，
+      // 基础金额 / 倍投 / 连败 / 止损 的自定义按钮点了会落进 default，毫无反应。
+      case 'w_base_custom':
+        await ctx.scene.enter('input', { field: 'base' });
+        break;
+      case 'w_ratio_custom':
+        await ctx.scene.enter('input', { field: 'ratio' });
+        break;
+      case 'w_maxlose_custom':
+        await ctx.scene.enter('input', { field: 'maxlose' });
+        break;
+      case 'w_stop_custom':
+        await ctx.scene.enter('input', { field: 'stop' });
+        break;
+      case 'w_minint_custom':
+        await ctx.scene.enter('input', { field: 'minint' });
+        break;
+
       case 'w_base':
         await this.handleNumeric(ctx, botUserId, params, 'base', { panelRenderer });
         break;
@@ -98,8 +118,16 @@ class RuleHandler {
         await this.handleDelete(ctx, botUserId, parseInt(params[0], 10), { panelRenderer, services });
         break;
 
-      default:
+      default: {
+        // 通用兜底：任何 w_{field}_custom 一律进入自定义输入场景，
+        // 以后面板新增数值项不必再回来补 case（避免再次出现「按钮点了没反应」）
+        const m = /^w_(streak|base|ratio|maxlose|stop|minint)_custom$/.exec(action || '');
+        if (m) {
+          await ctx.scene.enter('input', { field: m[1] });
+          break;
+        }
         logger.warn(`[RULE] 未知操作: ${action}`);
+      }
     }
   }
 

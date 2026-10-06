@@ -52,6 +52,34 @@ const ruleStateDao = {
   },
 
   /**
+   * 清理「待发超时」的状态（自愈用）
+   *
+   * 场景：连击满足后进入 armed，等待群里出现「底注」开盘信号才真正下注。
+   * 若开盘信号迟迟不来（群改版 / 关键词变了 / 该期已封盘 / 进程重启错过信号），
+   * armed 会永久停留，而策略执行器遇到 armed 就直接 continue，
+   * 导致该「规则 × 群」再也不会判定、不会下注、不会结算 —— 静默卡死。
+   *
+   * @param {number} ruleId
+   * @param {string} chatId
+   * @param {number} ttlMs - 待发最长保留时间（毫秒）
+   * @returns {boolean} 是否真的清掉了
+   */
+  clearStaleArmed(ruleId, chatId, ttlMs) {
+    const db = getConnection();
+    const seconds = Math.max(1, Math.round(Number(ttlMs || 0) / 1000));
+    const info = db.prepare(`
+      UPDATE rule_chat_state
+      SET armed_direction = NULL,
+          updated_at = datetime('now', '+8 hours')
+      WHERE rule_id = ? AND chat_id = ?
+        AND armed_direction IS NOT NULL
+        AND pending_direction IS NULL
+        AND updated_at < datetime('now', '+8 hours', ?)
+    `).run(ruleId, String(chatId), `-${seconds} seconds`);
+    return info.changes > 0;
+  },
+
+  /**
    * 重置规则全部群的状态（规则配置变更 / 人工启用）
    */
   resetByRule(ruleId) {

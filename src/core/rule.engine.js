@@ -51,24 +51,72 @@ function evaluateStreak(rule, value, recentValues) {
 }
 
 /**
+ * 浮点误差修正用的相对容差
+ *
+ * 二进制浮点无法精确表示 2.3 这类小数：
+ *   100 * 2.3            → 229.99999999999997（本该是 230）
+ *   100 * 2.3 * 2.3      → 529.0000000000001（本该是 529）
+ * 直接 Math.floor 会把 229.99999999999997 砍成 229，凭空少投 1 块。
+ * 先加一个「相对量级」的极小值把误差拉回，再向下取整。
+ * 相对量取 1e-9：远大于浮点误差（~1e-15），又远小于任何一个真实的下注最小单位。
+ */
+const FLOAT_EPS_REL = 1e-9;
+
+/**
+ * 对理论下注金额向下取整（带浮点误差修正）
+ * @param {number} raw - base × ratio^losses 的理论值（可能带浮点误差）
+ * @returns {number} 向下取整后的整数金额
+ */
+function floorAmount(raw) {
+  if (!Number.isFinite(raw)) return 0;
+  const corrected = raw + Math.abs(raw) * FLOAT_EPS_REL;
+  return Math.max(0, Math.floor(corrected));
+}
+
+/**
  * 计算下注金额（无上限倍投）
- * 无论连败多少次，严格按照 base × (ratio ^ losses) 计算
+ *
+ * 金额 = floor(base × ratio^losses)，向下取整。
+ *
+ * 为什么用 floor 而不是 round：
+ *   ratio 带小数（2.3 / 1.5 / 2.5 等）时理论值会出现小数，
+ *   下注金额必须是整数，向上取整会让实际投入超过预算，故统一向下取整。
+ *
+ * 另外做了两件保护：
+ *   1. 浮点误差修正：避免 229.99999999999997 被砍成 229
+ *   2. 严格递增：ratio > 1 时保证比上一注至少 +1，
+ *      否则 base=1 / ratio=1.05 这类小参数下会出现「连败了但金额没涨」的假倍投
  */
 function calcAmount(base, ratio, losses) {
-  if (base <= 0) throw new Error('基础下注金额必须 > 0');
-  if (ratio < 1.0) throw new Error('倍投比例必须 >= 1.0');
+  const b = Number(base);
+  const r = Number(ratio);
+  const l = Number(losses) || 0;
 
-  return Math.round(base * Math.pow(ratio, losses));
+  if (!(b > 0)) throw new Error('基础下注金额必须 > 0');
+  if (!(r >= 1.0)) throw new Error('倍投比例必须 >= 1.0');
+  if (!Number.isInteger(l) || l < 0) throw new Error('连败次数必须为非负整数');
+
+  let amount = floorAmount(b);
+  for (let i = 1; i <= l; i++) {
+    const next = floorAmount(b * Math.pow(r, i));
+    // ratio > 1 时保证严格递增，防止小参数下倍投停滞
+    amount = r > 1 ? Math.max(next, amount + 1) : next;
+  }
+  return Math.max(1, amount);
 }
 
 /**
  * 当前连败的累计投入（用于止损判定）
  * 从第 0 次连败到第 losses 次连败的注金之和
+ *
+ * 必须与 calcAmount 保持完全一致（逐项复用），
+ * 否则止损阈值和实际投出去的钱对不上。
  */
 function calcCumulativeStake(base, ratio, losses) {
+  const l = Number(losses) || 0;
   let total = 0;
-  for (let i = 0; i <= losses; i++) {
-    total += Math.round(base * Math.pow(ratio, i));
+  for (let i = 0; i <= l; i++) {
+    total += calcAmount(base, ratio, i);
   }
   return total;
 }

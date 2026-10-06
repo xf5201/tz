@@ -40,6 +40,7 @@ class BetSenderService {
    *
    * @param {string} botUserId
    * @param {object} action - action_logs 行（含 id/chat_id/action_text）
+   * @returns {Promise<boolean>} 是否真的发送成功（调用方据此决定是否进入挂起结算）
    */
   async sendBetMessage(botUserId, action) {
     const { id, chat_id, action_text } = action;
@@ -62,13 +63,15 @@ class BetSenderService {
       // 发送成功 → 更新状态为 SENT
       actionLogDao.markSent(id);
       logger.info(`[BET_SENDER] 用户 ${botUserId} 下注已发送: 消息=${sentMessage.id}`);
+      return true;
 
       // 推送面板更新
       if (this.notification) {
         await this.notification.pushToUser(botUserId).catch(() => {});
       }
     } catch (error) {
-      await this._handleSendError(botUserId, action, error);
+      // 重试成功也算成功，必须把结果如实回传给调用方
+      return await this._handleSendError(botUserId, action, error) === true;
     }
   }
 
@@ -109,7 +112,7 @@ class BetSenderService {
           `⚠️ 群 ${maskChatId(action.chat_id)} 已无法发言（被踢出或禁言），动作失败，全部规则已停用。`
         ).catch(() => {});
       }
-      return;
+      return false;
     }
 
     // 其他失败：退避重试
@@ -122,7 +125,7 @@ class BetSenderService {
         actionLogDao.markFailed(action.id, null);
         actionLogDao.markSent(action.id);
         logger.info(`[BET_SENDER] 用户 ${botUserId} 重试第 ${attempt} 次成功`);
-        return;
+        return true;
       } catch (retryError) {
         logger.warn(`[BET_SENDER] 用户 ${botUserId} 重试第 ${attempt} 次失败: ${retryError.message}`);
         if (attempt === MAX_RETRIES) {
@@ -141,6 +144,7 @@ class BetSenderService {
         }
       }
     }
+    return false;
   }
 }
 

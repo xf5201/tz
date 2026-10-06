@@ -2,7 +2,7 @@
 module.exports = {
   apps: [{
     // 应用名称（用于 pm2 命令）
-    name: 'tg-monitor-bot',
+    name: 'tz',
 
     // 启动脚本
     script: './src/index.js',

@@ -179,7 +179,7 @@ class RulePanel {
         desc: '两次下注之间强制间隔，防止密集发送',
         presets: [['0 秒', '0'], ['3 秒', '3'], ['5 秒', '5'], ['10 秒', '10']],
         callback: 'rule:w_minint',
-        custom: null,
+        custom: 'rule:w_minint_custom',
         current: draft.min_interval ?? 3,
       },
     }[kind];

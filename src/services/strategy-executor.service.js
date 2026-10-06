@@ -24,6 +24,15 @@ const RATE_LIMIT_PER_MIN = 20;
 // ═══════════════════════════════════════════
 const BET_WINDOW_KEYWORD = '底注:1u';
 
+// 待发（armed）超时：连击满足后若长时间等不到「底注」开盘信号，说明窗口已过，
+// 必须清掉 armed，否则 handleOpen 的 `if (state.armed_direction) continue`
+// 会让该「规则 × 群」永久不再判定、不再下注。
+const ARMED_TTL_MS = 3 * 60 * 1000;
+
+// 连击中断后是否清零连败：连败只在「同一条倍投链」内有意义，
+// 连击断了 = 这条链结束，新一轮应从基础金额重新开始。
+const RESET_LOSSES_ON_CHAIN_BREAK = true;
+
 /**
  * 判断消息是否为下注窗口开盘信号（识别到底注：1u）
  * @param {string|null} text - 消息文本
@@ -41,14 +50,13 @@ function isBetWindowMessage(text) {
 /**
  * 策略执行器（动态监测 + 底注闸门 + 结算消息判输赢）
  *
- * 消息驱动，按「规则 × 群」独立状态流转：
- *   dice（开奖）      → 结算由结算消息负责；此处做触发判定，满足连击 → armed（待发）
- *   底注:1u（开盘）    → armed 的下注真正发送 → pending（已发待结算）
- *   期输赢（结算）     → 解析结算消息，用登录账号用户 ID 匹配输赢与盈亏，
- *                        更新连败/止损；结算后立即用该条开奖点数评估下一轮待发
- *
  * 状态流转：无 → armed(待发) → pending(已发待结算) → 无（或连败后重新 armed）
- * 模拟模式：DRY_RUN 只记录，按结算消息中的开奖点数判定输赢，不产生盈亏金额。
+ *
+ * 修复要点（原实现的四个缺陷）：
+ *   1. 结算后重新待发用了过期 state 快照 → 每轮都跳过一轮，倍投链被腰斩
+ *   2. 发送结果未回写状态 → 发送失败时 pending 永久卡死，规则 × 群永久不动作
+ *   3. armed 等不到开盘信号时无任何清理 → 同样永久卡死
+ *   4. 最小间隔 / 限流的 key 不含 rule_id → 同群多规则时只有第一条规则能下注
  */
 class StrategyExecutorService {
   /**
@@ -61,8 +69,8 @@ class StrategyExecutorService {
     this.notification = deps.notification;
 
     // 运行时限流状态（内存即可，重启清零）
-    this._lastActionAt = new Map();  // "userId:chatId" → ts
-    this._rateWindow = new Map();    // "userId:chatId" → number[] 时间戳窗口
+    this._lastActionAt = new Map();  // "userId:chatId:ruleId" → ts
+    this._rateWindow = new Map();    // "userId:chatId:ruleId" → number[] 时间戳窗口
   }
 
   /**
@@ -79,12 +87,26 @@ class StrategyExecutorService {
 
     transaction(() => {
       for (const rule of rules) {
+        // 自愈：等不到开盘信号的 armed 必须清掉，否则规则 × 群永久不判定
+        if (ruleStateDao.clearStaleArmed(rule.id, chatId, ARMED_TTL_MS)) {
+          logger.warn(
+            `[STRATEGY_EXEC] 规则=${rule.id} 群=${maskChatId(chatId)} 待发超时已清理（未等到开盘信号）`
+          );
+        }
+
         const state = ruleStateDao.ensure(rule.id, chatId);
         // 待发 / 挂起期间不重复触发（挂起由结算消息处理）
         if (state.armed_direction || state.pending_direction) continue;
 
         const armed = this._tryArm(botUserId, rule, chatId, dice.value, armedRules);
-        void armed;
+
+        // 连击中断 = 本条倍投链结束 → 新一轮从基础金额开始
+        if (!armed && RESET_LOSSES_ON_CHAIN_BREAK && state.consecutive_losses > 0) {
+          ruleStateDao.updateState(rule.id, chatId, { consecutiveLosses: 0 });
+          logger.info(
+            `[STRATEGY_EXEC] 连击中断，连败清零: 规则=${rule.id}, 群=${maskChatId(chatId)}`
+          );
+        }
       }
     });
 
@@ -97,6 +119,9 @@ class StrategyExecutorService {
 
   /**
    * 开盘信号入口（识别到底注：1u）：把「待发」的下注真正发送出去
+   *
+   * 关键：只有「发送成功」才置 pending，失败则清掉 armed（本轮放弃），
+   * 避免 pending 卡死导致该规则 × 群永久不再下注。
    */
   async handleRoundOpen(botUserId, chatId) {
     const account = accountDao.getActive(botUserId);
@@ -105,21 +130,27 @@ class StrategyExecutorService {
     const rules = ruleDao.listEnabledByUser(botUserId);
     if (rules.length === 0) return;
 
-    const createdActions = [];
+    const candidates = [];
 
     transaction(() => {
       for (const rule of rules) {
+        if (ruleStateDao.clearStaleArmed(rule.id, chatId, ARMED_TTL_MS)) {
+          logger.warn(
+            `[STRATEGY_EXEC] 规则=${rule.id} 群=${maskChatId(chatId)} 待发超时已清理（未等到开盘信号）`
+          );
+        }
+
         const state = ruleStateDao.ensure(rule.id, chatId);
 
         // 只有「待发」状态才下注
         if (!state.armed_direction || state.pending_direction) continue;
 
-        // 前置校验：最小间隔 / 频率上限
-        if (!this._checkMinInterval(botUserId, chatId, rule.min_interval)) {
+        // 前置校验：最小间隔 / 频率上限（按 rule 维度，避免同群多规则互相吞额度）
+        if (!this._checkMinInterval(botUserId, chatId, rule.id, rule.min_interval)) {
           logger.info(`[STRATEGY_EXEC] 规则=${rule.id} 距上次动作不足 ${rule.min_interval}s，跳过本轮`);
           continue;
         }
-        if (!this._checkRateLimit(botUserId, chatId)) {
+        if (!this._checkRateLimit(botUserId, chatId, rule.id)) {
           logger.warn(`[STRATEGY_EXEC] 群 ${maskChatId(chatId)} 触发每分钟 ${RATE_LIMIT_PER_MIN} 次上限，跳过本轮`);
           continue;
         }
@@ -139,56 +170,77 @@ class StrategyExecutorService {
           status: isDry ? 'DRY_RUN' : 'CREATED',
         });
 
-        if (isDry) {
-          // 模拟：清掉待发，不进入结算流程，连败数不变
-          ruleStateDao.updateState(rule.id, chatId, {
-            armedDirection: null,
-            pendingDirection: null,
-          });
-        } else {
-          // 实发：进入挂起结算，等「期输赢」消息判输赢
-          ruleStateDao.updateState(rule.id, chatId, {
-            armedDirection: null,
-            pendingDirection: direction,
-          });
-        }
-
-        createdActions.push({
-          id: actionId,
-          chat_id: chatId,
-          action_text: actionText,
-          direction,
-          bet_amount: amount,
-          status: isDry ? 'DRY_RUN' : 'CREATED',
+        // 立即占位（事务内）：清 armed、置 pending。
+        // 必须在这里占位，不能等发送成功再置 —— 否则发送耗时期间（最长 30s）
+        // 若同一条开盘消息被 NewMessage 与轮询兜底重复投递，会再建一条下注＝重复下注。
+        // 发送失败时再在下方回滚 pending（本轮放弃），不会卡死。
+        ruleStateDao.updateState(rule.id, chatId, {
+          armedDirection: null,
+          pendingDirection: isDry ? null : direction,
         });
 
-        operationLogDao.insert({
-          bot_user_id: botUserId,
-          action: 'BET_CREATED',
-          detail: `规则「${rule.name || rule.id}」@${maskChatId(chatId)} 开盘下注: ${actionText}${isDry ? '（模拟）' : ''}`,
-        });
-        logger.info(
-          `[STRATEGY_EXEC] 下注创建: 用户=${botUserId}, 规则=${rule.id}, ` +
-          `群=${maskChatId(chatId)}, 动作=${actionText}${isDry ? ' (DRY_RUN)' : ''}`
-        );
+        candidates.push({ rule, direction, amount, actionId, actionText, isDry });
       }
     });
 
-    // 实发（事务外异步执行，不阻塞其他用户消息处理）
-    for (const action of createdActions) {
-      if (action.status === 'DRY_RUN') continue;
+    // 事务外逐个发送，按发送结果回写状态
+    for (const c of candidates) {
+      if (c.isDry) {
+        // 模拟：占位时未置 pending，这里无需回滚，连败数不变
+        operationLogDao.insert({
+          bot_user_id: botUserId,
+          action: 'BET_CREATED',
+          detail: `规则「${c.rule.name || c.rule.id}」@${maskChatId(chatId)} 开盘下注: ${c.actionText}（模拟）`,
+        });
+        continue;
+      }
+
+      let ok = false;
       try {
-        await this.betSender.sendBetMessage(botUserId, action);
+        ok = await this.betSender.sendBetMessage(botUserId, {
+          id: c.actionId,
+          chat_id: chatId,
+          action_text: c.actionText,
+        });
       } catch (err) {
         logger.error(`[STRATEGY_EXEC] 发送下注失败: ${err.message}`);
       }
+
+      if (ok) {
+        operationLogDao.insert({
+          bot_user_id: botUserId,
+          action: 'BET_CREATED',
+          detail: `规则「${c.rule.name || c.rule.id}」@${maskChatId(chatId)} 开盘下注: ${c.actionText}`,
+        });
+        logger.info(
+          `[STRATEGY_EXEC] 下注已发: 用户=${botUserId}, 规则=${c.rule.id}, ` +
+          `群=${maskChatId(chatId)}, 动作=${c.actionText}`
+        );
+      } else {
+        // 发送失败：回滚占位（pending → null），本轮放弃，等下一次连击重新触发
+        transaction(() => ruleStateDao.updateState(c.rule.id, chatId, {
+          armedDirection: null,
+          pendingDirection: null,
+        }));
+        operationLogDao.insert({
+          bot_user_id: botUserId,
+          action: 'BET_FAILED',
+          detail: `规则「${c.rule.name || c.rule.id}」@${maskChatId(chatId)} 下注发送失败，本轮放弃: ${c.actionText}`,
+        });
+        if (this.notification) {
+          await this.notification.notifyEvent(
+            botUserId,
+            `⚠️ 规则「${c.rule.name || c.rule.id}」本轮下注「${c.actionText}」发送失败，已放弃该轮（未进入挂起）。`
+          ).catch(() => {});
+        }
+      }
     }
 
-    if (createdActions.length > 0 && this.notification) {
+    if (candidates.length > 0 && this.notification) {
       await this.notification.pushToUser(botUserId).catch(() => {});
     }
 
-    return createdActions.length;
+    return candidates.length;
   }
 
   /**
@@ -215,62 +267,73 @@ class StrategyExecutorService {
 
     transaction(() => {
       for (const rule of rules) {
-        const state = ruleStateDao.ensure(rule.id, chatId);
+        let state = ruleStateDao.ensure(rule.id, chatId);
 
         // ── 实发注：按结算名单匹配本账号判定输赢 ──
         if (state.pending_direction) {
           const pending = actionLogDao.getLatestUnsettledSent(rule.id, chatId);
-          if (!pending) continue;
 
-          let isWin;
-          let profit;
-          if (settle.matched) {
-            isWin = settle.isWin ? 1 : 0;
-            if (settle.isWin) {
-              profit = settle.profit != null ? settle.profit : null; // 赢：消息里的净盈利
-            } else {
-              profit = settle.profit != null ? settle.profit : -pending.bet_amount; // 输：亏本金
-            }
+          if (!pending) {
+            // 异常自愈：挂起却没有可结算的已发记录（发送失败/记录错乱），
+            // 必须清掉 pending，否则该规则 × 群永久不再下注。
+            ruleStateDao.updateState(rule.id, chatId, { pendingDirection: null });
+            logger.warn(
+              `[STRATEGY_EXEC] 挂起状态无对应已发记录，已自愈清除: 规则=${rule.id}, 群=${maskChatId(chatId)}`
+            );
           } else {
-            // 结算名单没有本账号 → 输（输掉本金）
-            isWin = 0;
-            profit = -pending.bet_amount;
-          }
+            let isWin;
+            let profit;
+            if (settle.matched) {
+              isWin = settle.isWin ? 1 : 0;
+              if (settle.isWin) {
+                profit = settle.profit != null ? settle.profit : null; // 赢：消息里的净盈利
+              } else {
+                profit = settle.profit != null ? settle.profit : -pending.bet_amount; // 输：亏本金
+              }
+            } else {
+              // 结算名单没有本账号 → 输（输掉本金）
+              isWin = 0;
+              profit = -pending.bet_amount;
+            }
 
-          const changed = actionLogDao.markSettled(pending.id, isWin, profit);
-          if (!changed) continue; // 已被并发结算
+            const changed = actionLogDao.markSettled(pending.id, isWin, profit);
+            if (changed) {
+              const newLosses = isWin ? 0 : state.consecutive_losses + 1;
+              ruleStateDao.updateState(rule.id, chatId, {
+                consecutiveLosses: newLosses,
+                pendingDirection: null,
+              });
+              settledCount++;
 
-          const newLosses = isWin ? 0 : state.consecutive_losses + 1;
-          ruleStateDao.updateState(rule.id, chatId, {
-            consecutiveLosses: newLosses,
-            pendingDirection: null,
-          });
-          settledCount++;
+              logger.info(
+                `[STRATEGY_EXEC] 结算: 规则=${rule.id}, 群=${maskChatId(chatId)}, ` +
+                `方向=${state.pending_direction}, 点数=${settle.diceValue}, ` +
+                `${isWin ? '赢' : '输'}${profit != null ? ` 盈亏=${profit}` : ''}, 连败=${newLosses}`
+              );
+              operationLogDao.insert({
+                bot_user_id: botUserId,
+                action: 'BET_SETTLED',
+                detail: `规则「${rule.name || rule.id}」@${maskChatId(chatId)} ` +
+                  `${isWin ? '赢' : '输'}${profit != null ? ` ${profit}` : ''}，连败 ${newLosses}`,
+              });
 
-          logger.info(
-            `[STRATEGY_EXEC] 结算: 规则=${rule.id}, 群=${maskChatId(chatId)}, ` +
-            `方向=${state.pending_direction}, 点数=${settle.diceValue}, ` +
-            `${isWin ? '赢' : '输'}${profit != null ? ` 盈亏=${profit}` : ''}, 连败=${newLosses}`
-          );
-          operationLogDao.insert({
-            bot_user_id: botUserId,
-            action: 'BET_SETTLED',
-            detail: `规则「${rule.name || rule.id}」@${maskChatId(chatId)} ` +
-              `${isWin ? '赢' : '输'}${profit != null ? ` ${profit}` : ''}，连败 ${newLosses}`,
-          });
-
-          // 止损硬约束：连败上限 / 累计投入止损
-          if (newLosses >= rule.max_lose_streak) {
-            ruleDao.update(rule.id, { enabled: 0 });
-            pausedRules.push({ rule, chatId, reason: `连续未中 ${newLosses} 次，已达连败上限 ${rule.max_lose_streak}` });
-            continue;
-          }
-          if (rule.stop_loss != null) {
-            const stake = calcCumulativeStake(rule.base_bet, rule.martingale_ratio, newLosses);
-            if (stake >= rule.stop_loss) {
-              ruleDao.update(rule.id, { enabled: 0 });
-              pausedRules.push({ rule, chatId, reason: `累计投入 ${stake} 已达止损上限 ${rule.stop_loss}` });
-              continue;
+              // 止损硬约束：连败上限
+              if (newLosses >= rule.max_lose_streak) {
+                ruleDao.update(rule.id, { enabled: 0 });
+                pausedRules.push({ rule, chatId, reason: `连续未中 ${newLosses} 次，已达连败上限 ${rule.max_lose_streak}` });
+                continue;
+              }
+              // 止损硬约束：累计投入（只算「已经真实投出去的钱」，不再多算下一注）
+              if (rule.stop_loss != null) {
+                const spent = calcCumulativeStake(
+                  rule.base_bet, rule.martingale_ratio, Math.max(0, newLosses - 1)
+                );
+                if (spent >= rule.stop_loss) {
+                  ruleDao.update(rule.id, { enabled: 0 });
+                  pausedRules.push({ rule, chatId, reason: `累计投入 ${spent} 已达止损上限 ${rule.stop_loss}` });
+                  continue;
+                }
+              }
             }
           }
         } else {
@@ -289,7 +352,11 @@ class StrategyExecutorService {
           }
         }
 
-        // ── 结算后立即用该条开奖点数评估下一轮「待发」（避免隔轮跳注） ──
+        // ── 结算后立即用该条开奖点数评估下一轮「待发」──
+        // 关键修复：必须重新读一次状态，原代码用的是函数开头拿到的过期快照
+        // （state.pending_direction 仍是旧值），导致这里永远进不来，
+        // 结果「每次结算后都要空过一轮」，倍投链直接被腰斩。
+        state = ruleStateDao.ensure(rule.id, chatId);
         if (settle.diceValue != null && !state.armed_direction && !state.pending_direction) {
           this._tryArm(botUserId, rule, chatId, settle.diceValue, armedRules);
         }
@@ -345,13 +412,13 @@ class StrategyExecutorService {
   }
 
   /**
-   * 最小动作间隔校验（同群同用户）
+   * 最小动作间隔校验（同群同规则）
    */
-  _checkMinInterval(botUserId, chatId, minIntervalSec) {
+  _checkMinInterval(botUserId, chatId, ruleId, minIntervalSec) {
     const interval = Math.max(0, Number(minIntervalSec) || 0) * 1000;
     if (interval <= 0) return true;
 
-    const key = `${botUserId}:${chatId}`;
+    const key = `${botUserId}:${chatId}:${ruleId}`;
     const last = this._lastActionAt.get(key) || 0;
     const now = Date.now();
     if (now - last < interval) return false;
@@ -361,10 +428,10 @@ class StrategyExecutorService {
   }
 
   /**
-   * 频率上限校验（单群滑动窗口）
+   * 频率上限校验（同群同规则滑动窗口）
    */
-  _checkRateLimit(botUserId, chatId) {
-    const key = `${botUserId}:${chatId}`;
+  _checkRateLimit(botUserId, chatId, ruleId) {
+    const key = `${botUserId}:${chatId}:${ruleId}`;
     const now = Date.now();
     const window = (this._rateWindow.get(key) || []).filter((ts) => now - ts < 60_000);
 
