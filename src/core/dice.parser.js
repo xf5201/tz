@@ -93,6 +93,88 @@ function parseBalance(text) {
 }
 
 /**
+ * 判断是否为「主动查询余额」的回复消息
+ *
+ * 我们往群里发「余额」两个字后，机器人回复形如：
+ *   👤 昵称: 小花猫
+ *   🆔 ID: 7653490880
+ *
+ *   💰 USDT : 0.000
+ *   💰 CNY : 0.720
+ *   💰 JIBA : 0.640
+ *   💰 TRX : 0
+ *   ————————
+ *
+ * 识别特征：含「昵称」+「ID」+「JIBA」三种字样，
+ * 与开奖 / 结算 / 下注回复都能区分开。
+ *
+ * @param {string|null} text
+ * @returns {boolean}
+ */
+function isBalanceQueryReply(text) {
+  const raw = String(text || '');
+  if (!raw) return false;
+  return raw.includes('昵称') && /\bID\b/i.test(raw) && /JIBA/i.test(raw);
+}
+
+/**
+ * 解析「主动查询余额」的回复
+ *
+ * 币种很多（USDT / CNY / JIBA / TRX…），下注用的是 JIBA，
+ * 因此只取 JIBA 那一行作为余额，其余币种忽略。
+ *
+ * @param {string|null} text
+ * @returns {{
+ *   jiba: number|null,      // JIBA 余额（本业务唯一用得到的币种）
+ *   nickname: string|null,  // 👤 昵称
+ *   userId: string|null     // 🆔 ID（用于归属判定，最可靠）
+ * }}
+ */
+function parseBalanceQuery(text) {
+  const raw = String(text || '');
+  if (!raw) return { jiba: null, nickname: null, userId: null };
+
+  // JIBA 余额（大小写不敏感，兼容 jiba / JIBA / Jiba）
+  const jibaMatch = raw.match(/JIBA\s*[:：]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/i);
+  const jiba = jibaMatch ? parseFloat(jibaMatch[1].replace(/,/g, '')) : null;
+
+  // 昵称：👤 昵称: 小花猫
+  const nickMatch = raw.match(/昵称\s*[:：]\s*([^\n]+)/);
+  const nickname = nickMatch ? nickMatch[1].trim() : null;
+
+  // ID：🆔 ID: 7653490880
+  const idMatch = raw.match(/ID\s*[:：]\s*([0-9]+)/i);
+  const userId = idMatch ? idMatch[1].trim() : null;
+
+  return {
+    jiba: Number.isFinite(jiba) ? jiba : null,
+    nickname,
+    userId,
+  };
+}
+
+/**
+ * 判断余额播报是否属于某个昵称（兜底归属）
+ *
+ * 播报首行是下注人昵称，形如：
+ *   👤可乐❤️挂机胜率99%
+ *   👤小花猫
+ * 因此只在**首行**里找昵称，避免「可乐」误命中「可乐2」「可乐小号」等别人的名字。
+ *
+ * 用途：余额不足停注后不再下注，也就收不到「回复自己下注」的播报；
+ * 此时只能靠昵称在群里认领自己的播报（被动检测，不用发消息）。
+ *
+ * @param {string|null} text
+ * @param {string|null} nickname - 本账号在群里的下注昵称（.env BALANCE_NICKNAME）
+ * @returns {boolean}
+ */
+function isBalanceForNickname(text, nickname) {
+  if (!text || !nickname) return false;
+  const firstLine = String(text).split('\n')[0] || '';
+  return firstLine.includes(String(nickname).trim());
+}
+
+/**
  * 判定机器人对下注的回复是「投注成功」还是「失败」
  *
  * 成功样例（必须有 ✅ 投注成功）：
@@ -195,5 +277,8 @@ module.exports = {
   isBalanceMessage,
   parseBalance,
   parseBetResult,
+  isBalanceForNickname,
+  isBalanceQueryReply,
+  parseBalanceQuery,
   getReplyToMsgId,
 };

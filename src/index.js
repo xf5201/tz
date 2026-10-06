@@ -42,6 +42,7 @@ const DicePollerService = require('./services/dice-poller.service');
 const MessageDispatcherService = require('./services/message-dispatcher.service');
 const { StrategyExecutorService } = require('./services/strategy-executor.service');
 const BetSenderService = require('./services/bet-sender.service');
+const BalanceQueryService = require('./services/balance-query.service');
 const NotificationService = require('./services/notification.service');
 
 // ── Bot ──
@@ -113,6 +114,9 @@ async function main() {
 
   const betSender = new BetSenderService({ sessionManager, notification: notificationService });
 
+  // 主动余额查询：发「余额」到群里问一次（停注后充值能自动恢复的关键）
+  const balanceQuery = new BalanceQueryService({ sessionManager });
+
   const strategyExecutor = new StrategyExecutorService({
     betSender,
     notification: notificationService,
@@ -151,6 +155,7 @@ async function main() {
     listener: listenerService,
     strategyExecutor,
     betSender,
+    balanceQuery,
     notification: notificationService,
     panelRenderer,
     panelContextDao,

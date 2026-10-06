@@ -46,6 +46,10 @@ class DashboardHandler {
         await this.handleResumeProfit(ctx, botUserId, { panelRenderer, services });
         break;
 
+      case 'query_balance':
+        await this.handleQueryBalance(ctx, botUserId, { panelRenderer, services });
+        break;
+
       default:
         logger.warn(`[DASHBOARD] 未知操作: ${action}`);
     }
@@ -181,6 +185,21 @@ class DashboardHandler {
     }
 
     await services.strategyExecutor.resumeFromTakeProfit(botUserId);
+    await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+  }
+
+  /**
+   * 主动查询余额：往一个已监听的群发「余额」，机器人回复后自动更新
+   *
+   * 用于充值后立刻刷新（不用重启、不用等下一次下注回复）。
+   */
+  static async handleQueryBalance(ctx, botUserId, { panelRenderer, services }) {
+    if (services && services.balanceQuery) {
+      const res = await services.balanceQuery.queryBalance(botUserId).catch(() => null);
+      if (res && !res.sent) {
+        logger.warn(`[DASHBOARD] 用户 ${botUserId} 余额查询未发出: ${res.reason}`);
+      }
+    }
     await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
   }
 }

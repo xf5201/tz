@@ -162,6 +162,9 @@ class DashboardPanel {
         }
       }
 
+      // 主动查余额：往群里发「余额」问一次（充值后不用重启就能恢复）
+      buttons.push([Markup.button.callback('🔍 查询余额', 'dashboard:query_balance')]);
+
       buttons.push([Markup.button.callback('🗑️ 删除账号', 'account:delete_confirm')]);
     }
 

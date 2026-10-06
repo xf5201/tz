@@ -6,7 +6,8 @@ const accountDao = require('../db/account.dao');
 const logger = require('../utils/logger');
 const { maskChatId } = require('../utils/mask.util');
 const {
-  parseDiceMessage, isSettleMessage, parseBalance, parseBetResult, getReplyToMsgId,
+  parseDiceMessage, isSettleMessage, parseBalance, parseBetResult,
+  isBalanceQueryReply, parseBalanceQuery, getReplyToMsgId, isBalanceForNickname,
 } = require('../core/dice.parser');
 const { isBetWindowMessage } = require('./strategy-executor.service');
 const { get: getConfigValue } = require('../utils/config.loader');
@@ -63,6 +64,10 @@ class MessageDispatcherService {
       kind = 'settle';
     } else if (isBetWindowMessage(message.message)) {
       kind = 'window';
+    } else if (isBalanceQueryReply(message.message)) {
+      // 主动查询余额的回复：发「余额」后机器人回的（含昵称+ID+各币种）
+      // 必须先于 parseBalance 判定——它同样含「余额」字样，会被误判成下注播报
+      kind = 'balance_query';
     } else if (parseBalance(message.message) != null) {
       // 余额播报：机器人对某条下注的回复（形如 💰余额：1123690.20 JIBA）
       kind = 'balance';
@@ -70,9 +75,9 @@ class MessageDispatcherService {
       return;
     }
 
-    // ── 余额播报：必须先确认归属，只写本账号的余额 ──
-    // 判定链：① 必须是「回复某条消息」② 被回复的那条是本账号发出的下注消息
-    //        ③ 该账号正在监听本群（在 targets 里）
+    // ── 余额类消息：必须先确认归属，只写本账号的余额 ──
+    //   下注播报：靠「回复的是不是自己那条下注消息」
+    //   主动查询回复：靠 🆔 ID 匹配（最可靠），ID 取不到再靠昵称
     // 任一条不满足 → 丢弃，绝不猜测（别人的余额绝不能记到自己账上）
     let balanceOwner = null;
     let bet = null;
@@ -83,6 +88,14 @@ class MessageDispatcherService {
       if (!balanceOwner) {
         logger.debug(
           `[DISPATCH] 余额播报无法归属本账号，已忽略: 群=${maskChatId(chatId)}, 消息=${message.id}`
+        );
+        return;
+      }
+    } else if (kind === 'balance_query') {
+      balanceOwner = this._resolveQueryOwner(message, targets);
+      if (!balanceOwner) {
+        logger.debug(
+          `[DISPATCH] 余额查询回复不属于本账号，已忽略: 群=${maskChatId(chatId)}, 消息=${message.id}`
         );
         return;
       }
@@ -120,6 +133,29 @@ class MessageDispatcherService {
       return;
     }
 
+    if (kind === 'balance_query') {
+      // 主动查询回复：取下注用的 JIBA 币种作为余额
+      const { jiba } = parseBalanceQuery(message.message);
+      if (jiba == null) {
+        logger.debug(`[DISPATCH] 余额查询回复未解析到 JIBA，已忽略: 消息=${message.id}`);
+        return;
+      }
+      const before = accountDao.getActive(balanceOwner);
+      const wasDepleted = before && before.balance != null && Number(before.balance) <= 0;
+      accountDao.updateBalance(balanceOwner, jiba);
+      logger.info(
+        `[DISPATCH] 余额查询更新: 用户=${balanceOwner}, 群=${maskChatId(chatId)}, JIBA=${jiba}`
+      );
+
+      // 余额从「见底」恢复 → 通知用户已自动恢复下注
+      if (wasDepleted && jiba > 0 && this.strategyExecutor) {
+        await this.strategyExecutor.notifyBalanceRestored(balanceOwner, jiba).catch((err) =>
+          logger.error(`[DISPATCH] notifyBalanceRestored 异常: ${err.message}`)
+        );
+      }
+      return;
+    }
+
     if (kind === 'balance') {
       const balance = parseBalance(message.message);
       accountDao.updateBalance(balanceOwner, balance);
@@ -151,6 +187,42 @@ class MessageDispatcherService {
       await this.strategyExecutor.handleRoundOpen(userId, chatId)
         .catch((err) => logger.error(`[DISPATCH] handleRoundOpen 异常: 用户=${userId}, ${err.message}`));
     }
+  }
+
+  /**
+   * 判定「主动查询余额」的回复属于哪个账号
+   *
+   * 群里每个人查余额都会收到一条，全都在同一条消息流里，因此必须认人：
+   *   ① 🆔 ID 与账号的 TG 用户 ID 完全一致 → 命中（最可靠，优先）
+   *   ② ID 取不到时，用 .env BALANCE_NICKNAME 比对 👤 昵称（只在首行比，
+   *      避免「可乐」误命中「可乐2」）
+   *   ③ 命中人还必须在监听本群（targets）
+   * 都不满足 → 返回 null，绝不猜测。
+   *
+   * @param {object} message
+   * @param {string[]} targets - 正在监听本群的账号
+   * @returns {string|null}
+   */
+  _resolveQueryOwner(message, targets) {
+    const { userId } = parseBalanceQuery(message.message);
+    const targetSet = targets.map(String);
+
+    // ① ID 精确匹配
+    if (userId && targetSet.includes(String(userId))) return String(userId);
+
+    // ② 昵称兜底（需配置 BALANCE_NICKNAME）
+    let nickname = null;
+    try {
+      nickname = getConfigValue('balanceNickname');
+    } catch (_) {
+      nickname = null;
+    }
+    if (nickname && isBalanceForNickname(message.message, nickname)) {
+      // 昵称命中的账号必须在监听本群；只有一个监听账号时直接认它
+      if (targetSet.length === 1) return targetSet[0];
+    }
+
+    return null;
   }
 
   /**

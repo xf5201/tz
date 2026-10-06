@@ -85,17 +85,22 @@ class AccountHandler {
     const account = accountDao.getActive(botUserId);
     if (!account) throw new Error('请先登录账号');
 
-    await services.account.setListenEnabled(botUserId, !account.listen_enabled);
-    logger.info(`[ACCOUNT] 用户 ${botUserId} 监听开关 → ${!account.listen_enabled ? '开' : '关'}`);
+    const enabled = !account.listen_enabled;
+    await services.account.setListenEnabled(botUserId, enabled);
+    logger.info(`[ACCOUNT] 用户 ${botUserId} 监听开关 → ${enabled ? '开' : '关'}`);
 
-    const chats = monitoredChatDao.listByUser(botUserId);
-    const rules = ruleDao.listByUser(botUserId);
-    await panelRenderer.render(ctx, 'dashboard', {
-      user: { id: botUserId },
-      account: accountDao.getActive(botUserId),
-      chats,
-      rules,
-    });
+    // 开启监听时主动查一次余额：往已监听的群发「余额」，机器人回各币种余额。
+    // 这样即使当前余额是 0（停注状态，收不到下注回复），也能立刻拿到真实余额，
+    // 充值后不用重启即可自动恢复下注。
+    if (enabled && services.balanceQuery) {
+      const res = await services.balanceQuery.queryBalance(botUserId).catch(() => null);
+      if (res && !res.sent) {
+        logger.warn(`[ACCOUNT] 用户 ${botUserId} 开启监听后余额查询未发出: ${res.reason}`);
+      }
+    }
+
+    const DashboardHandler = require('./dashboard.handler');
+    await panelRenderer.render(ctx, 'dashboard', DashboardHandler.collectData(botUserId));
   }
 }
 

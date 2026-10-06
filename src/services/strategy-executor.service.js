@@ -746,6 +746,30 @@ class StrategyExecutorService {
   }
 
   /**
+   * 余额从「见底」恢复的通知（充值后自动继续，无需人工启用规则）
+   *
+   * @param {string} botUserId
+   * @param {number} balance - 恢复后的余额
+   */
+  async notifyBalanceRestored(botUserId, balance) {
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: 'BALANCE_RESTORED',
+      detail: `余额已恢复至 ${balance}，全局停注解除，自动继续下注`,
+    });
+    logger.info(`[STRATEGY_EXEC] 余额已恢复: 用户=${botUserId}, 余额=${balance}`);
+
+    if (this.notification) {
+      await this.notification.notifyEvent(
+        botUserId,
+        `✅ <b>余额已恢复，自动继续</b>\n当前余额：${balance}\n` +
+        '全局停注已解除，规则将在下一次连击触发时恢复下注。'
+      ).catch(() => {});
+      await this.notification.pushToUser(botUserId).catch(() => {});
+    }
+  }
+
+  /**
    * 今日盈利（北京时间 00:00 起的已结算盈亏合计）
    * @param {string} botUserId
    * @returns {number}
