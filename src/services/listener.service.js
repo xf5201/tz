@@ -1,38 +1,34 @@
 // src/services/listener.service.js
 const { NewMessage } = require('telegram/events');
-const { Api } = require('telegram');
 
-const accountDao = require('../db/account.dao');
 const monitoredChatDao = require('../db/monitored-chat.dao');
-const messageLogDao = require('../db/message-log.dao');
 const logger = require('../utils/logger');
-const { maskChatId } = require('../utils/mask.util');
-const { parseDiceMessage, isSettleMessage } = require('../core/dice.parser');
-const { isBetWindowMessage } = require('./strategy-executor.service');
 
 /**
  * 消息监听服务
  *
  * 职责：
  *   - 为每个已连接账号的 Client 注册 NewMessage 处理器
- *   - 仅处理该用户勾选的监听群（多群白名单，内存缓存 + 变更时刷新）
- *   - 去重（message_logs UNIQUE(chat_id,msg_id) 兜底 + 内存短期待处理集合）
- *   - 解析骰子开奖消息 → 写流水 → 投递给策略执行器
+ *   - 收到消息后统一交给 MessageDispatcher：
+ *     分类 → 按 (chat_id, msg_id) 全局去重入库 → 分发给全部监听该群的账号
+ *   （多账号共用群时，同一条消息只入库一条、只处理一次；
+ *     此前按账号各自处理，监听与轮询双通道重复投递结算/开盘消息
+ *     会引发重复下注与漏结算）
  *
  * 接口：
  *   startForUser(botUserId, client)
- *   invalidateChatsCache(botUserId)
+ *   invalidateChatsCache(botUserId)   // 兼容保留：白名单已改为实时查库，无需刷新缓存
  *   stopByUser(botUserId)
  */
 class ListenerService {
   /**
    * @param {object} deps
-   * @param {object} deps.strategyExecutor - 策略执行器（handleOpen）
+   * @param {object} deps.messageDispatcher - 消息分发服务
    */
   constructor(deps) {
-    this.strategyExecutor = deps.strategyExecutor;
+    this.messageDispatcher = deps.messageDispatcher;
 
-    // botUserId → { client, chatSet: Set<chatId> }
+    // botUserId → { client }
     this._listeners = new Map();
   }
 
@@ -45,33 +41,25 @@ class ListenerService {
     const userId = String(botUserId);
     if (this._listeners.has(userId)) return;
 
-    const chats = monitoredChatDao.listByUser(userId);
-    const listener = {
-      client,
-      chatSet: new Set(chats.map((c) => c.chat_id)),
-    };
+    const chatCount = monitoredChatDao.listByUser(userId).length;
 
     client.addEventHandler(async (event) => {
-      await this._onMessage(userId, event).catch((err) => {
+      await this._onMessage(event).catch((err) => {
         logger.error(`[LISTENER] 用户 ${userId} 消息处理异常: ${err.message}`);
       });
     }, new NewMessage({}));
 
-    this._listeners.set(userId, listener);
-    logger.info(`[LISTENER] 用户 ${userId} 监听已启动: ${listener.chatSet.size} 个群`);
+    this._listeners.set(userId, { client });
+    logger.info(`[LISTENER] 用户 ${userId} 监听已启动: ${chatCount} 个群`);
   }
 
   /**
    * 监听群配置变更后刷新内存缓存
+   * （兼容保留：分发目标已改为实时查库，本方法无需做任何事）
    * @param {string} botUserId
    */
   invalidateChatsCache(botUserId) {
-    const userId = String(botUserId);
-    const listener = this._listeners.get(userId);
-    if (!listener) return;
-    const chats = monitoredChatDao.listByUser(userId);
-    listener.chatSet = new Set(chats.map((c) => c.chat_id));
-    logger.info(`[LISTENER] 用户 ${userId} 监听群缓存已刷新: ${listener.chatSet.size} 个群`);
+    logger.info(`[LISTENER] 用户 ${String(botUserId)} 监听群配置已变更（实时查库，无需刷新）`);
   }
 
   /**
@@ -83,57 +71,14 @@ class ListenerService {
   }
 
   /**
-   * 消息处理主流程：
-   *   监听开关 → 群白名单 → 骰子解析 → 去重 → 流水入库 → 策略执行器
+   * 消息处理：交给分发器（分类 → 去重 → 按群分发）
    */
-  async _onMessage(userId, event) {
-    const listener = this._listeners.get(userId);
-    if (!listener) return;
-
-    // 监听开关（暂停时不中断登录态）
-    const account = accountDao.getActive(userId);
-    if (!account || !account.listen_enabled) return;
-
+  async _onMessage(event) {
     const message = event?.message;
     if (!message) return;
 
     const chatId = message.chatId ? message.chatId.toString() : null;
-    if (!chatId || !listener.chatSet.has(chatId)) return;
-
-    // 消息分类：骰子开奖 → 触发判定；结算消息 → 判输赢；开盘信号 → 发下注
-    const dice = parseDiceMessage(message);
-    if (!dice) {
-      // 结算消息（❤️第xxx期输赢）：解析本账号输赢与盈亏
-      if (isSettleMessage(message.message)) {
-        await this.strategyExecutor.handleSettleMessage(userId, chatId, message.message);
-        return;
-      }
-      // 开盘信号（识别到底注：1u）：把「待发」的下注真正发送出去
-      if (isBetWindowMessage(message.message)) {
-        await this.strategyExecutor.handleRoundOpen(userId, chatId);
-      }
-      return;
-    }
-
-    // 去重：数据库 UNIQUE(chat_id, msg_id) 兜底，重复消息直接丢弃
-    const isNew = messageLogDao.insert({
-      bot_user_id: userId,
-      chat_id: chatId,
-      msg_id: dice.msgId,
-      sender_id: dice.senderId,
-      msg_type: dice.msgType,
-      value: dice.value,
-      raw_text: dice.rawText,
-    });
-    if (!isNew) return;
-
-    logger.info(
-      `[LISTENER] 开奖: 用户=${userId}, 群=${maskChatId(chatId)}, ` +
-      `点数=${dice.value}, 消息=${dice.msgId}`
-    );
-
-    // 投递给策略执行器（规则判定 + 自动下注）
-    await this.strategyExecutor.handleOpen(userId, chatId, dice);
+    await this.messageDispatcher.dispatch(message, chatId);
   }
 }
 

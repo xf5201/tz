@@ -29,6 +29,15 @@ const BET_WINDOW_KEYWORD = '底注:1u';
 // 会让该「规则 × 群」永久不再判定、不再下注。
 const ARMED_TTL_MS = 3 * 60 * 1000;
 
+// 挂起（pending）超时：下注后若长时间等不到结算消息（结算消息丢失 /
+// 群消息改版），挂起会永久卡住该「规则 × 群」。巡检兜底超过该时长即解除并告警。
+const PENDING_TTL_MS = 10 * 60 * 1000;
+
+// 发送在途保护窗口（秒）：下注消息发送超时 30s + 两次退避重试（2s/8s）+ 重试发送
+// 最长约 100s。窗口内存在 CREATED 动作说明发送还在进行，
+// 此刻结算消息到达不能清挂起，否则发送完成后该注永远等不到结算（漏结算）。
+const SEND_IN_FLIGHT_GUARD_SECONDS = 120;
+
 // 连击中断后是否清零连败：连败只在「同一条倍投链」内有意义，
 // 连击断了 = 这条链结束，新一轮应从基础金额重新开始。
 const RESET_LOSSES_ON_CHAIN_BREAK = true;
@@ -276,10 +285,20 @@ class StrategyExecutorService {
           if (!pending) {
             // 异常自愈：挂起却没有可结算的已发记录（发送失败/记录错乱），
             // 必须清掉 pending，否则该规则 × 群永久不再下注。
-            ruleStateDao.updateState(rule.id, chatId, { pendingDirection: null });
-            logger.warn(
-              `[STRATEGY_EXEC] 挂起状态无对应已发记录，已自愈清除: 规则=${rule.id}, 群=${maskChatId(chatId)}`
-            );
+            // 但发送在途保护窗口内（存在近期 CREATED 动作）不能清：
+            // 此刻下注正在发送，清掉会让它发送完成后永远等不到结算。
+            const inFlight = actionLogDao.getRecentCreated(rule.id, chatId, SEND_IN_FLIGHT_GUARD_SECONDS);
+            if (inFlight) {
+              logger.info(
+                `[STRATEGY_EXEC] 结算消息到达但下注仍在发送中，跳过本次结算与清理: ` +
+                `规则=${rule.id}, 群=${maskChatId(chatId)}, 动作=${inFlight.action_text}`
+              );
+            } else {
+              ruleStateDao.updateState(rule.id, chatId, { pendingDirection: null });
+              logger.warn(
+                `[STRATEGY_EXEC] 挂起状态无对应已发记录，已自愈清除: 规则=${rule.id}, 群=${maskChatId(chatId)}`
+              );
+            }
           } else {
             let isWin;
             let profit;
@@ -383,6 +402,52 @@ class StrategyExecutorService {
     }
 
     return settledCount;
+  }
+
+  /**
+   * 挂起超时巡检（兜底，由定时器周期调用）
+   *
+   * 结算消息一旦丢失（轮询窗口跳过 / 群方改版消息格式），挂起会永久停留，
+   * 该「规则 × 群」不再判定、不再下注 —— 静默卡死。超过 PENDING_TTL_MS
+   * 仍未结算的挂起在此解除并告警，让倍投链恢复运转。
+   *
+   * 注意：解除时不猜测输赢，对应动作记录保留未结算状态，由人工对账。
+   *
+   * @returns {number} 解除的挂起数
+   */
+  async sweepStalePending() {
+    const stale = ruleStateDao.listStalePending(Math.round(PENDING_TTL_MS / 1000));
+    if (stale.length === 0) return 0;
+
+    const ttlMin = Math.round(PENDING_TTL_MS / 60000);
+    for (const row of stale) {
+      transaction(() => ruleStateDao.updateState(row.rule_id, row.chat_id, { pendingDirection: null }));
+      logger.warn(
+        `[STRATEGY_EXEC] 挂起超时已解除: 规则=${row.rule_id}, 群=${maskChatId(row.chat_id)}` +
+        `（超过 ${ttlMin} 分钟未等到结算消息）`
+      );
+      operationLogDao.insert({
+        bot_user_id: row.bot_user_id,
+        action: 'BET_SETTLE_TIMEOUT',
+        detail: `规则「${row.rule_name || row.rule_id}」@${maskChatId(row.chat_id)} ` +
+          `挂起下注「${row.pending_direction === 'BIG' ? '大' : '小'}」超过 ${ttlMin} 分钟未等到结算消息，已解除挂起`,
+      });
+      if (this.notification) {
+        await this.notification.notifyEvent(
+          row.bot_user_id,
+          `⏱ 规则「${row.rule_name || row.rule_id}」@${maskChatId(row.chat_id)} 的挂起下注超过 ` +
+            `${ttlMin} 分钟未等到结算消息，已解除挂起恢复运转。该笔输赢未记录，请人工核对。`
+        ).catch(() => {});
+      }
+    }
+
+    if (this.notification) {
+      for (const userId of [...new Set(stale.map((r) => r.bot_user_id))]) {
+        await this.notification.pushToUser(userId).catch(() => {});
+      }
+    }
+
+    return stale.length;
   }
 
   /**

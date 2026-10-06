@@ -39,6 +39,7 @@ const SessionManager = require('./services/session.manager');
 const AccountService = require('./services/account.service');
 const ListenerService = require('./services/listener.service');
 const DicePollerService = require('./services/dice-poller.service');
+const MessageDispatcherService = require('./services/message-dispatcher.service');
 const { StrategyExecutorService } = require('./services/strategy-executor.service');
 const BetSenderService = require('./services/bet-sender.service');
 const NotificationService = require('./services/notification.service');
@@ -115,12 +116,18 @@ async function main() {
     notification: notificationService,
   });
 
-  const listenerService = new ListenerService({ strategyExecutor });
+  // 消息分发器（唯一消息入口）：分类 → (chat_id,msg_id) 全局去重 → 按群分发给全部在线监听账号
+  const messageDispatcher = new MessageDispatcherService({
+    sessionManager,
+    strategyExecutor,
+  });
+
+  const listenerService = new ListenerService({ messageDispatcher });
 
   // 骰子开奖轮询（pc28 crawler 同构）：部分群组服务器不推送实时更新，按群轮询兜底
   const dicePoller = new DicePollerService({
     sessionManager,
-    strategyExecutor,
+    messageDispatcher,
     intervalMs: config.dicePollIntervalMs,
   });
 
@@ -255,7 +262,7 @@ async function main() {
   }
 
   // ═══════════════════════════════════════════
-  // 8. 数据保留定时清理（每小时）
+  // 8. 数据保留定时清理（每小时）+ 挂起超时巡检（每分钟）
   // ═══════════════════════════════════════════
   const cleanupTimer = setInterval(() => {
     try {
@@ -271,6 +278,14 @@ async function main() {
     }
   }, 3600 * 1000);
   if (cleanupTimer.unref) cleanupTimer.unref();
+
+  // 挂起超时巡检：结算消息丢失时解除卡死的挂起，避免「规则 × 群」永久停摆
+  const pendingSweepTimer = setInterval(() => {
+    strategyExecutor.sweepStalePending().catch((err) => {
+      logger.warn(`[BOOT] 挂起超时巡检失败: ${err.message}`);
+    });
+  }, 60 * 1000);
+  if (pendingSweepTimer.unref) pendingSweepTimer.unref();
 
   // ═══════════════════════════════════════════
   // 9. 启动 Bot
@@ -299,6 +314,7 @@ async function main() {
 
     clearInterval(refreshTimer);
     clearInterval(cleanupTimer);
+    clearInterval(pendingSweepTimer);
     dicePoller.stop();
 
     // 停止 Bot

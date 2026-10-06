@@ -140,6 +140,26 @@ const actionLogDao = {
   },
 
   /**
+   * 规则在某群近期是否有 CREATED（发送在途）动作
+   *
+   * 用途：结算消息到达时若下注仍在发送中（状态还是 CREATED，尚未转 SENT），
+   * 不能把挂起清掉——否则发送完成后这笔注永远等不到结算（漏结算）。
+   * @param {number} ruleId
+   * @param {string} chatId
+   * @param {number} seconds - 视为「在途」的时间窗口
+   * @returns {object|undefined}
+   */
+  getRecentCreated(ruleId, chatId, seconds) {
+    const db = getConnection();
+    return db.prepare(`
+      SELECT * FROM action_logs
+      WHERE rule_id = ? AND chat_id = ? AND status = 'CREATED'
+        AND created_at >= datetime('now', '+8 hours', ?)
+      ORDER BY id DESC LIMIT 1
+    `).get(ruleId, String(chatId), `-${Math.max(1, seconds)} seconds`);
+  },
+
+  /**
    * 写入结算结果（幂等：仅当未结算时生效）
    * @param {number} id
    * @param {0|1} isWin

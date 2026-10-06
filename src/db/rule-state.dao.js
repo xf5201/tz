@@ -121,6 +121,31 @@ const ruleStateDao = {
       'SELECT COUNT(*) AS n FROM rule_chat_state WHERE pending_direction IS NOT NULL'
     ).get().n;
   },
+
+  /**
+   * 挂起超时的「规则 × 群」列表（巡检兜底用）
+   *
+   * 场景：结算消息丢失（轮询窗口跳过 / 群消息改版）时，pending 永久停留，
+   * 该「规则 × 群」不再判定、不再下注 —— 静默卡死。
+   * 附带最近一条未结算实发注的创建时间，供告警信息与人工对账。
+   *
+   * @param {number} ttlSeconds - 挂起最长保留时间（秒）
+   * @returns {Array} 含 bot_user_id / rule_name / last_unsettled_at
+   */
+  listStalePending(ttlSeconds) {
+    const db = getConnection();
+    return db.prepare(`
+      SELECT s.rule_id, s.chat_id, s.pending_direction, s.updated_at,
+             r.bot_user_id, r.name AS rule_name,
+             (SELECT MAX(a.created_at) FROM action_logs a
+              WHERE a.rule_id = s.rule_id AND a.chat_id = s.chat_id
+                AND a.status = 'SENT' AND a.settled_at IS NULL) AS last_unsettled_at
+      FROM rule_chat_state s
+      JOIN rules r ON r.id = s.rule_id
+      WHERE s.pending_direction IS NOT NULL
+        AND s.updated_at < datetime('now', '+8 hours', ?)
+    `).all(`-${Math.max(1, ttlSeconds)} seconds`);
+  },
 };
 
 module.exports = ruleStateDao;

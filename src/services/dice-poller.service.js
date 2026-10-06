@@ -1,11 +1,8 @@
 // src/services/dice-poller.service.js
 const accountDao = require('../db/account.dao');
 const monitoredChatDao = require('../db/monitored-chat.dao');
-const messageLogDao = require('../db/message-log.dao');
 const logger = require('../utils/logger');
 const { maskChatId } = require('../utils/mask.util');
-const { parseDiceMessage, isSettleMessage } = require('../core/dice.parser');
-const { isBetWindowMessage } = require('./strategy-executor.service');
 
 /**
  * 骰子开奖轮询服务（与 pc28 的 crawler.service 同构：拉取代替推送）
@@ -14,25 +11,31 @@ const { isBetWindowMessage } = require('./strategy-executor.service');
  * （Raw 层 0 推送，但 getMessages 拉取正常、账号成员身份正常），
  * 因此在 NewMessage 监听之外增加按群轮询兜底：
  *   - 每 DICE_POLL_INTERVAL_MS 轮询一轮全部在线账号的全部监听群
- *   - 每群 getMessages(limit 5)，解析骰子开奖
+ *   - 每群 getMessages(limit 30)，解析后统一交给 MessageDispatcher
  *   - 首轮只记录水位不补发历史（避免虚假连击）
- *   - 去重：message_logs UNIQUE(chat_id, msg_id) + 内存水位双保险，
- *     与 NewMessage 监听共存不会重复入库/重复触发
+ *   - 去重：分发器内 message_logs UNIQUE(chat_id, msg_id) 全局兜底，
+ *     与 NewMessage 监听、多账号共用群重叠投递时同一条消息只处理一次
+ *
+ * 窗口取 30：繁忙群（玩家下注消息多）5 秒内可能产生大量消息，
+ * 窗口过小（10）会跳过中间消息，造成漏开奖/漏结算。
  */
 // 单次消息拉取超时（毫秒）：GramJS 连接假死时 getMessages 会永久挂起
 // （既不成功也不抛错），必须用超时兜底，否则轮询会无声卡死。
 const GET_MESSAGES_TIMEOUT_MS = 15000;
 
+// 每群单次拉取的消息条数（消息窗口）
+const POLL_MESSAGE_LIMIT = 30;
+
 class DicePollerService {
   /**
    * @param {object} deps
    * @param {object} deps.sessionManager
-   * @param {object} deps.strategyExecutor
+   * @param {object} deps.messageDispatcher - 消息分发服务（分类+去重+按群分发）
    * @param {number} deps.intervalMs - 轮询间隔
    */
   constructor(deps) {
     this.sessionManager = deps.sessionManager;
-    this.strategyExecutor = deps.strategyExecutor;
+    this.messageDispatcher = deps.messageDispatcher;
     this.intervalMs = deps.intervalMs || 5000;
     this._timer = null;
     this._polling = false;
@@ -89,10 +92,10 @@ class DicePollerService {
   }
 
   /**
-   * 轮询单个群：取最近若干条，按水位增量处理（骰子开奖 + 底注开盘信号）
+   * 轮询单个群：取最近若干条，按水位增量处理（开奖 / 结算 / 开盘信号统一交给分发器）
    */
   async _pollChat(userId, client, chatId) {
-    const msgs = await this._getMessagesWithTimeout(client, chatId, 10);
+    const msgs = await this._getMessagesWithTimeout(client, chatId, POLL_MESSAGE_LIMIT);
     const key = `${userId}:${chatId}`;
     const watermark = this._lastMsgId.get(key) || 0;
 
@@ -102,38 +105,12 @@ class DicePollerService {
       return;
     }
 
-    // 旧 → 新逐条处理
+    // 旧 → 新逐条处理；消息级去重由分发器统一兜底
     for (const m of msgs.reverse()) {
       const msgIdNum = Number(m.id);
       if (msgIdNum <= this._lastMsgId.get(key)) continue;
       this._lastMsgId.set(key, msgIdNum);
-
-      const dice = parseDiceMessage(m);
-      if (dice) {
-        // 双保险去重（与 NewMessage 监听共存）：库内已存在则跳过
-        const isNew = messageLogDao.insert({
-          bot_user_id: userId,
-          chat_id: chatId,
-          msg_id: dice.msgId,
-          sender_id: dice.senderId,
-          msg_type: dice.msgType,
-          value: dice.value,
-          raw_text: dice.rawText,
-        });
-        if (!isNew) continue;
-
-        logger.info(
-          `[DICE_POLLER] 开奖: 用户=${userId}, 群=${maskChatId(chatId)}, ` +
-          `点数=${dice.value}, 消息=${dice.msgId}`
-        );
-        await this.strategyExecutor.handleOpen(userId, chatId, dice);
-      } else if (isSettleMessage(m.message)) {
-        // 结算消息（❤️第xxx期输赢）：解析本账号输赢与盈亏
-        await this.strategyExecutor.handleSettleMessage(userId, chatId, m.message);
-      } else if (isBetWindowMessage(m.message)) {
-        // 开盘信号（识别到底注：1u）：把「待发」的下注真正发送出去
-        await this.strategyExecutor.handleRoundOpen(userId, chatId);
-      }
+      await this.messageDispatcher.dispatch(m, chatId);
     }
   }
 

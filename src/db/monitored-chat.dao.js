@@ -52,6 +52,21 @@ const monitoredChatDao = {
   },
 
   /**
+   * 监听某群的全部「ACTIVE 且开启监听」账号（消息分发目标）
+   * @param {string} chatId
+   * @returns {string[]} bot_user_id 列表
+   */
+  listActiveUsersByChat(chatId) {
+    const db = getConnection();
+    return db.prepare(`
+      SELECT DISTINCT mc.bot_user_id
+      FROM monitored_chats mc
+      JOIN accounts a ON a.bot_user_id = mc.bot_user_id
+      WHERE mc.chat_id = ? AND a.status = 'ACTIVE' AND a.listen_enabled = 1
+    `).all(String(chatId)).map((r) => r.bot_user_id);
+  },
+
+  /**
    * 用户监听群数量
    * @param {string} botUserId
    * @returns {number}
