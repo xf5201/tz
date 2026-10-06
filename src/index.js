@@ -54,6 +54,7 @@ const { handleStart } = require('./bot/commands/start.command');
 
 // ── Handlers ──
 const LoginTextHandler = require('./bot/handlers/login-text.handler');
+const DashboardHandler = require('./bot/handlers/dashboard.handler');
 
 // ── Scenes ──
 const inputScene = require('./bot/scenes/input.scene');
@@ -68,7 +69,8 @@ async function main() {
   let config;
   try {
     config = getConfig();
-    console.log('[BOOT] 配置加载完成');
+    // 终端只留这一行指路信息，其余过程日志一律写文件（LOG_CONSOLE=true 可恢复全部输出）
+    if (config.logConsole) console.log('[BOOT] 配置加载完成');
   } catch (error) {
     console.error('[BOOT] 配置加载失败:', error.message);
     process.exit(1);
@@ -195,11 +197,6 @@ async function main() {
 
   // ── 定时刷新主面板（与 pc28 同款防重叠闸门） ──
   let refreshRunning = false;
-  const beijingMidnight = () => {
-    const shifted = new Date(Date.now() + 8 * 3600 * 1000);
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} 00:00:00`;
-  };
   const refreshTimer = setInterval(async () => {
     if (refreshRunning) return;
     refreshRunning = true;
@@ -207,21 +204,8 @@ async function main() {
       const activeUsers = panelContextDao.getActiveUsers('dashboard');
       for (const userId of activeUsers) {
         try {
-          const account = accountDao.getActive(userId);
-          const chats = monitoredChatDao.listByUser(userId);
-          const rules = ruleDao.listByUser(userId);
-          const throughput = messageLogDao.countRecent(userId, 10);
-          const latestFailed = actionLogDao.latestFailed(userId);
-          const todayProfit = Math.round(actionLogDao.sumProfit(userId, beijingMidnight()) * 100) / 100;
-          await panelRenderer.pushUpdate(userId, 'dashboard', {
-            user: { id: userId },
-            account,
-            chats,
-            rules,
-            throughput,
-            todayProfit,
-            latestFailed,
-          });
+          // 与主面板「刷新」按钮共用同一份数据（含余额、停注群、今日盈利）
+          await panelRenderer.pushUpdate(userId, 'dashboard', DashboardHandler.collectData(userId));
         } catch (err) {
           logger.warn(`[BOOT] 定时刷新面板失败: 用户=${userId}, ${err.message}`);
         }

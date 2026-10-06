@@ -57,6 +57,58 @@ function isSettleMessage(text) {
 }
 
 /**
+ * 判断是否为余额播报消息（机器人对下注的回复，形如）：
+ *   👤可乐❤️挂机胜率99%
+ *   🎲 期号: bbc10e69...
+ *   大 -600 JIBA - ✅ 投注成功
+ *   ——————————————————
+ *   💰余额：1123690.20 JIBA
+ *
+ * @param {string|null} text
+ * @returns {boolean}
+ */
+function isBalanceMessage(text) {
+  if (!text) return false;
+  return parseBalance(String(text)) != null;
+}
+
+/**
+ * 解析余额播报消息中的余额数字
+ *
+ * 兼容写法：💰余额：1234.56 / 余额: 1234 / 💰 余额 1234.56 JIBA
+ * 千分位逗号与空格均兼容（1,123,690.20）。
+ *
+ * @param {string|null} text
+ * @returns {number|null} 余额；解析不到返回 null
+ */
+function parseBalance(text) {
+  const raw = String(text || '');
+  if (!raw.includes('余额')) return null;
+
+  const m = raw.match(/余额\s*[:：]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/);
+  if (!m) return null;
+
+  const value = parseFloat(m[1].replace(/,/g, ''));
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * 取消息所回复的那条消息 ID（GramJS 两种结构都兼容）
+ *
+ * 余额播报是机器人「回复我们的下注消息」发出来的，
+ * 靠 reply_to 才能确认这余额是本账号的，绝不能拿别人的余额。
+ *
+ * @param {object} message
+ * @returns {string|null}
+ */
+function getReplyToMsgId(message) {
+  const reply = message?.replyTo;
+  if (!reply) return null;
+  const id = reply.replyToMsgId ?? reply.reply_to_msg_id ?? reply.msgId;
+  return id != null ? String(id) : null;
+}
+
+/**
  * 解析结算消息：开奖点数 + 用登录账号的用户 ID 匹配本账号的输赢
  *
  * 获胜行形如：　奔驰 迈巴赫 【7016374749】 大 5,赢 4.75 💰
@@ -102,4 +154,11 @@ function parseSettle(text, userId) {
   return { diceValue, matched: true, isWin, profit: Number.isFinite(profit) ? profit : null };
 }
 
-module.exports = { parseDiceMessage, isSettleMessage, parseSettle };
+module.exports = {
+  parseDiceMessage,
+  isSettleMessage,
+  parseSettle,
+  isBalanceMessage,
+  parseBalance,
+  getReplyToMsgId,
+};

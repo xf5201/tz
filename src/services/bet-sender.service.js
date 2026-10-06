@@ -60,8 +60,9 @@ class BetSenderService {
       // 发送消息到目标群（带超时保护）
       const sentMessage = await this._sendWithTimeout(client, chat_id, action_text);
 
-      // 发送成功 → 更新状态为 SENT
-      actionLogDao.markSent(id);
+      // 发送成功 → 更新状态为 SENT，并记下这条下注消息在群里的 msg_id
+      // （机器人随后的余额播报是对这条消息的回复，靠它把余额归属到本账号）
+      actionLogDao.markSent(id, null, sentMessage?.id);
       logger.info(`[BET_SENDER] 用户 ${botUserId} 下注已发送: 消息=${sentMessage.id}`);
       return true;
 
@@ -121,9 +122,9 @@ class BetSenderService {
       try {
         const client = this.sessionManager.getClient(botUserId);
         if (!client) throw new Error('TG Client 未连接');
-        await this._sendWithTimeout(client, action.chat_id, action.action_text);
+        const resent = await this._sendWithTimeout(client, action.chat_id, action.action_text);
         actionLogDao.markFailed(action.id, null);
-        actionLogDao.markSent(action.id);
+        actionLogDao.markSent(action.id, null, resent?.id);
         logger.info(`[BET_SENDER] 用户 ${botUserId} 重试第 ${attempt} 次成功`);
         return true;
       } catch (retryError) {

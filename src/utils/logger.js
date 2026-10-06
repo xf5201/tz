@@ -36,6 +36,8 @@ class Logger {
     this._initialized = false;
     this._streams = {};
     this._level = LEVELS.info;
+    // 控制台输出开关：默认关闭（终端保持干净，日志一律写文件）
+    this._console = false;
   }
 
   /**
@@ -53,6 +55,7 @@ class Logger {
       }
 
       this._level = LEVELS[config.logLevel] ?? LEVELS.info;
+      this._console = config.logConsole === true;
 
       this._streams = {
         app: fs.createWriteStream(path.join(logDir, 'app.log'), { flags: 'a' }),
@@ -76,14 +79,16 @@ class Logger {
     const line = `[${getLocalTime()}] [${level.toUpperCase()}] ${message}` +
       (meta ? ` ${JSON.stringify(meta)}` : '');
 
-    // 控制台（带颜色）
-    const color = LEVEL_COLORS[level] || '';
-    if (level === 'error') {
-      console.error(`${color}${line}${RESET}`);
-    } else if (level === 'warn') {
-      console.warn(`${color}${line}${RESET}`);
-    } else {
-      console.log(`${color}${line}${RESET}`);
+    // 控制台（带颜色）：仅 LOG_CONSOLE=true 时输出
+    if (this._console) {
+      const color = LEVEL_COLORS[level] || '';
+      if (level === 'error') {
+        console.error(`${color}${line}${RESET}`);
+      } else if (level === 'warn') {
+        console.warn(`${color}${line}${RESET}`);
+      } else {
+        console.log(`${color}${line}${RESET}`);
+      }
     }
 
     // 文件

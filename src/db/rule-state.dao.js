@@ -27,7 +27,9 @@ const ruleStateDao = {
   /**
    * 更新状态（连败数 / 待发方向 / 挂起方向，传 undefined 表示保持不变）
    */
-  updateState(ruleId, chatId, { consecutiveLosses, armedDirection, pendingDirection } = {}) {
+  updateState(ruleId, chatId, {
+    consecutiveLosses, armedDirection, pendingDirection, streakBroken,
+  } = {}) {
     const db = getConnection();
     const sets = [];
     const values = [];
@@ -43,12 +45,107 @@ const ruleStateDao = {
       sets.push('pending_direction = ?');
       values.push(pendingDirection ?? null);
     }
+    if (streakBroken !== undefined) {
+      sets.push('streak_broken = ?');
+      values.push(streakBroken ? 1 : 0);
+    }
     if (!sets.length) return;
     sets.push("updated_at = datetime('now', '+8 hours')");
     values.push(ruleId, String(chatId));
     db.prepare(`
       UPDATE rule_chat_state SET ${sets.join(', ')} WHERE rule_id = ? AND chat_id = ?
     `).run(...values);
+  },
+
+  /**
+   * 停掉某条规则在某个群的下注（连败 / 止损达到上限时调用）
+   *
+   * 与「停用整条规则」的区别：规则本身继续在其他群运行，
+   * 仅本群不再判定、不再下注；连败清零、待发/挂起清空。
+   *
+   * @param {number} ruleId
+   * @param {string} chatId
+   * @param {string} reason - 停用原因（面板展示 / 通知文案）
+   */
+  blockChat(ruleId, chatId, reason) {
+    const db = getConnection();
+    db.prepare(`
+      UPDATE rule_chat_state
+      SET blocked = 1,
+          blocked_reason = ?,
+          blocked_at = datetime('now', '+8 hours'),
+          consecutive_losses = 0,
+          armed_direction = NULL,
+          pending_direction = NULL,
+          streak_broken = 0,
+          updated_at = datetime('now', '+8 hours')
+      WHERE rule_id = ? AND chat_id = ?
+    `).run(String(reason || '').slice(0, 200), ruleId, String(chatId));
+  },
+
+  /**
+   * 解除某个群的停注（下一次触发自动恢复 / 人工恢复）
+   *
+   * 恢复时连败必须清零，否则一进来就按倍投金额下注。
+   *
+   * @param {number} ruleId
+   * @param {string} chatId
+   * @returns {boolean} 是否真的解除了
+   */
+  unblockChat(ruleId, chatId) {
+    const db = getConnection();
+    const info = db.prepare(`
+      UPDATE rule_chat_state
+      SET blocked = 0,
+          blocked_reason = NULL,
+          blocked_at = NULL,
+          consecutive_losses = 0,
+          streak_broken = 0,
+          armed_direction = NULL,
+          updated_at = datetime('now', '+8 hours')
+      WHERE rule_id = ? AND chat_id = ? AND blocked = 1
+    `).run(ruleId, String(chatId));
+    return info.changes > 0;
+  },
+
+  /**
+   * 用户全部被停注的「规则 × 群」（面板展示 / 人工恢复）
+   *
+   * @param {string} botUserId
+   * @returns {Array} 含 rule_id / chat_id / blocked_reason / blocked_at / rule_name
+   */
+  listBlockedByUser(botUserId) {
+    const db = getConnection();
+    return db.prepare(`
+      SELECT s.rule_id, s.chat_id, s.blocked_reason, s.blocked_at,
+             r.name AS rule_name, r.bot_user_id
+      FROM rule_chat_state s
+      JOIN rules r ON r.id = s.rule_id
+      WHERE r.bot_user_id = ? AND s.blocked = 1
+      ORDER BY s.blocked_at DESC
+    `).all(String(botUserId));
+  },
+
+  /**
+   * 解除某用户的全部停注群（人工一键恢复）
+   * @param {string} botUserId
+   * @returns {number} 恢复的群数
+   */
+  unblockAllByUser(botUserId) {
+    const db = getConnection();
+    return db.prepare(`
+      UPDATE rule_chat_state
+      SET blocked = 0,
+          blocked_reason = NULL,
+          blocked_at = NULL,
+          consecutive_losses = 0,
+          streak_broken = 0,
+          armed_direction = NULL,
+          updated_at = datetime('now', '+8 hours')
+      WHERE blocked = 1 AND rule_id IN (
+        SELECT id FROM rules WHERE bot_user_id = ?
+      )
+    `).run(String(botUserId)).changes;
   },
 
   /**
@@ -87,6 +184,7 @@ const ruleStateDao = {
     db.prepare(`
       UPDATE rule_chat_state
       SET consecutive_losses = 0, armed_direction = NULL, pending_direction = NULL,
+          blocked = 0, blocked_reason = NULL, blocked_at = NULL, streak_broken = 0,
           updated_at = datetime('now', '+8 hours')
       WHERE rule_id = ?
     `).run(ruleId);

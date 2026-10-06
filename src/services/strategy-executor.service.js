@@ -93,6 +93,7 @@ class StrategyExecutorService {
     if (rules.length === 0) return;
 
     const armedRules = [];
+    const resumedChats = [];
 
     transaction(() => {
       for (const rule of rules) {
@@ -104,6 +105,16 @@ class StrategyExecutorService {
         }
 
         const state = ruleStateDao.ensure(rule.id, chatId);
+
+        // 本群已单独停注：不下注，只观察连击是否重新满足（满足则自动恢复）
+        if (state.blocked) {
+          const resumed = this._evalBlockedResume(
+            botUserId, rule, chatId, dice.value, state, armedRules
+          );
+          if (resumed) resumedChats.push(resumed);
+          continue;
+        }
+
         // 待发 / 挂起期间不重复触发（挂起由结算消息处理）
         if (state.armed_direction || state.pending_direction) continue;
 
@@ -119,7 +130,18 @@ class StrategyExecutorService {
       }
     });
 
-    if (armedRules.length > 0 && this.notification) {
+    // 停注群自动恢复通知
+    for (const chat of resumedChats) {
+      if (this.notification) {
+        await this.notification.notifyEvent(
+          botUserId,
+          `▶️ 规则「${chat.rule.name || chat.rule.id}」@${maskChatId(chat.chatId)} ` +
+            `连击重新满足，已自动恢复下注（连败已清零）。`
+        ).catch(() => {});
+      }
+    }
+
+    if ((armedRules.length > 0 || resumedChats.length > 0) && this.notification) {
       await this.notification.pushToUser(botUserId).catch(() => {});
     }
 
@@ -150,6 +172,9 @@ class StrategyExecutorService {
         }
 
         const state = ruleStateDao.ensure(rule.id, chatId);
+
+        // 本群已单独停注（连败/止损达上限）→ 不下注，等连击重新满足自动恢复
+        if (state.blocked) continue;
 
         // 只有「待发」状态才下注
         if (!state.armed_direction || state.pending_direction) continue;
@@ -270,7 +295,7 @@ class StrategyExecutorService {
 
     // botUserId 即登录账号的 TG 用户 ID（登录时强制同账号）
     const settle = parseSettle(text, botUserId);
-    const pausedRules = [];
+    const blockedChats = [];
     const armedRules = [];
     let settledCount = 0;
 
@@ -337,9 +362,12 @@ class StrategyExecutorService {
               });
 
               // 止损硬约束：连败上限
+              // 只停「这个群」—— 规则本身继续在别的群运行，
+              // 本群等连击中断后下一次触发自动恢复（连败清零）
               if (newLosses >= rule.max_lose_streak) {
-                ruleDao.update(rule.id, { enabled: 0 });
-                pausedRules.push({ rule, chatId, reason: `连续未中 ${newLosses} 次，已达连败上限 ${rule.max_lose_streak}` });
+                const reason = `连续未中 ${newLosses} 次，已达连败上限 ${rule.max_lose_streak}`;
+                ruleStateDao.blockChat(rule.id, chatId, reason);
+                blockedChats.push({ rule, chatId, reason });
                 continue;
               }
               // 止损硬约束：累计投入（只算「已经真实投出去的钱」，不再多算下一注）
@@ -348,8 +376,9 @@ class StrategyExecutorService {
                   rule.base_bet, rule.martingale_ratio, Math.max(0, newLosses - 1)
                 );
                 if (spent >= rule.stop_loss) {
-                  ruleDao.update(rule.id, { enabled: 0 });
-                  pausedRules.push({ rule, chatId, reason: `累计投入 ${spent} 已达止损上限 ${rule.stop_loss}` });
+                  const reason = `累计投入 ${spent} 已达止损上限 ${rule.stop_loss}`;
+                  ruleStateDao.blockChat(rule.id, chatId, reason);
+                  blockedChats.push({ rule, chatId, reason });
                   continue;
                 }
               }
@@ -376,28 +405,35 @@ class StrategyExecutorService {
         // （state.pending_direction 仍是旧值），导致这里永远进不来，
         // 结果「每次结算后都要空过一轮」，倍投链直接被腰斩。
         state = ruleStateDao.ensure(rule.id, chatId);
+        // 已停注的群：结算完就好，不再进入下一轮待发
+        if (state.blocked) continue;
         if (settle.diceValue != null && !state.armed_direction && !state.pending_direction) {
           this._tryArm(botUserId, rule, chatId, settle.diceValue, armedRules);
         }
       }
     });
 
-    // 停用通知
-    for (const { rule, chatId, reason } of pausedRules) {
+    // 单群停注通知（规则仍在别的群继续运行）
+    for (const { rule, chatId, reason } of blockedChats) {
       operationLogDao.insert({
         bot_user_id: botUserId,
-        action: 'RULE_AUTO_PAUSED',
-        detail: `规则「${rule.name || rule.id}」已自动停用：${reason}（群 ${maskChatId(chatId)}）`,
+        action: 'CHAT_AUTO_BLOCKED',
+        detail: `规则「${rule.name || rule.id}」@${maskChatId(chatId)} 已停注：${reason}`,
       });
+      logger.warn(
+        `[STRATEGY_EXEC] 群停注: 规则=${rule.id}, 群=${maskChatId(chatId)}, 原因=${reason}`
+      );
       if (this.notification) {
         await this.notification.notifyEvent(
           botUserId,
-          `🛑 规则「${rule.name || rule.id}」已自动停用：${reason}\n触发群：${maskChatId(chatId)}\n需人工确认后到「规则配置」重新启用。`
-        );
+          `🛑 规则「${rule.name || rule.id}」已在本群停注：${reason}\n` +
+          `群：${maskChatId(chatId)}\n` +
+          `规则继续在其它群运行；本群等连击中断后重新触发即自动恢复（连败清零）。`
+        ).catch(() => {});
       }
     }
 
-    if ((settledCount > 0 || armedRules.length > 0) && this.notification) {
+    if ((settledCount > 0 || armedRules.length > 0 || blockedChats.length > 0) && this.notification) {
       await this.notification.pushToUser(botUserId).catch(() => {});
     }
 
@@ -448,6 +484,50 @@ class StrategyExecutorService {
     }
 
     return stale.length;
+  }
+
+  /**
+   * 停注群的恢复评估（开奖入口调用，需在事务内）
+   *
+   * 恢复条件（两步，缺一不可）：
+   *   1. 停注之后出现了至少一次「连击中断」—— 否则连败刚达上限时
+   *      连击往往还在延续，会立刻恢复，等于没停；
+   *   2. 连击再次满足（连续 N 把同大小）—— 即用户说的「等下一次触发」。
+   *
+   * 恢复时连败清零，本轮立即按基础金额进入待发，不再沿用倍投金额。
+   *
+   * @returns {{rule: object, chatId: string}|null} 本次是否恢复
+   */
+  _evalBlockedResume(botUserId, rule, chatId, diceValue, state, armedRules) {
+    const need = Math.max(2, rule.streak_count || 2);
+    const recentValues = messageLogDao.recentValues(chatId, need + 1).slice(1);
+    const direction = evaluateStreak(rule, diceValue, recentValues);
+
+    if (!direction) {
+      // 连击中断 → 记下标记，等下一次连击满足时再恢复
+      if (!state.streak_broken) {
+        ruleStateDao.updateState(rule.id, chatId, { streakBroken: 1 });
+        logger.info(
+          `[STRATEGY_EXEC] 停注群连击已中断，等待下次触发恢复: 规则=${rule.id}, 群=${maskChatId(chatId)}`
+        );
+      }
+      return null;
+    }
+
+    if (!state.streak_broken) return null; // 同一条连击链还没断，继续停注
+
+    // 连击重新满足 → 自动恢复本群（连败清零），并立即进入本轮待发
+    ruleStateDao.unblockChat(rule.id, chatId);
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: 'CHAT_AUTO_RESUMED',
+      detail: `规则「${rule.name || rule.id}」@${maskChatId(chatId)} 连击重新满足，已自动恢复下注（连败清零）`,
+    });
+    logger.info(
+      `[STRATEGY_EXEC] 停注群已自动恢复: 规则=${rule.id}, 群=${maskChatId(chatId)}`
+    );
+    this._tryArm(botUserId, rule, chatId, diceValue, armedRules);
+    return { rule, chatId };
   }
 
   /**
@@ -516,6 +596,28 @@ class StrategyExecutorService {
    */
   resetRuleState(ruleId) {
     ruleStateDao.resetByRule(ruleId);
+  }
+
+  /**
+   * 人工一键恢复：解除某用户全部停注群（连败清零）
+   *
+   * 正常情况下停注群会在「连击中断后再次触发」时自动恢复，
+   * 这个方法用于不想再等、立刻全部恢复的场景。
+   *
+   * @param {string} botUserId
+   * @returns {number} 恢复的群数
+   */
+  resumeBlockedChats(botUserId) {
+    const n = ruleStateDao.unblockAllByUser(botUserId);
+    if (n > 0) {
+      operationLogDao.insert({
+        bot_user_id: botUserId,
+        action: 'CHAT_MANUAL_RESUMED',
+        detail: `人工恢复 ${n} 个停注群（连败已清零）`,
+      });
+      logger.info(`[STRATEGY_EXEC] 用户 ${botUserId} 人工恢复停注群 ${n} 个`);
+    }
+    return n;
   }
 }
 

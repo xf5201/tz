@@ -17,6 +17,9 @@ const fs = require('fs');
  *   NODE_ENV               - 运行环境（默认 production）
  *   MESSAGE_RETENTION_DAYS - 消息流水保留天数（默认 90）
  *   ACTION_RETENTION_DAYS  - 动作记录保留天数（默认 180）
+ *   DICE_POLL_INTERVAL_MS  - 开奖轮询间隔（默认 5000）
+ *   LOG_CONSOLE            - 日志是否打印到终端（默认 false，只写日志文件）
+ *   BALANCE_NICKNAME       - 本账号在群里的下注昵称（可选，余额播报归属二次校验）
  */
 
 // 加载 .env（如果存在）
@@ -45,6 +48,10 @@ const DEFAULTS = {
   MESSAGE_RETENTION_DAYS: '90',
   ACTION_RETENTION_DAYS: '180',
   DICE_POLL_INTERVAL_MS: '5000',
+  // 控制台日志开关：默认关闭（日志只写文件，终端保持干净）
+  LOG_CONSOLE: 'false',
+  // 本账号在群里下注时显示的昵称（可选）：余额播报里必须出现它才认领余额
+  BALANCE_NICKNAME: '',
 };
 
 /**
@@ -94,6 +101,10 @@ function loadConfig() {
     process.env.DICE_POLL_INTERVAL_MS || DEFAULTS.DICE_POLL_INTERVAL_MS,
     10
   ),
+  // 终端日志开关：LOG_CONSOLE=true 才往终端打印，否则只写日志文件
+  logConsole: String(process.env.LOG_CONSOLE || DEFAULTS.LOG_CONSOLE).toLowerCase() === 'true',
+  // 余额播报昵称校验（空 = 不校验，仅靠 reply 归属）
+  balanceNickname: (process.env.BALANCE_NICKNAME || DEFAULTS.BALANCE_NICKNAME).trim(),
 };
 
   // 校验 TG_API_ID 为数字

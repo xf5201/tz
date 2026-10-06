@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     status         TEXT NOT NULL DEFAULT 'PENDING_SETUP'
                    CHECK(status IN ('PENDING_SETUP','ACTIVE','ERROR','LOGGED_OUT','DELETED')),
     last_error     TEXT NULL,
+    -- 当前余额：由「下注后机器人回复的余额消息」解析写入（只认本账号自己的回复）
+    balance        REAL NULL,
+    balance_updated_at DATETIME NULL,
     created_at     DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     updated_at     DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     FOREIGN KEY (bot_user_id) REFERENCES bot_users(bot_user_id)
@@ -95,11 +98,19 @@ CREATE TABLE IF NOT EXISTS rule_chat_state (
     consecutive_losses INTEGER NOT NULL DEFAULT 0,
     armed_direction    TEXT NULL,
     pending_direction  TEXT NULL,
+    -- 该群是否被单独停注（连败/止损达到上限时只停这个群，规则本身继续跑）
+    blocked            INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0,1)),
+    blocked_reason     TEXT NULL,
+    blocked_at         DATETIME NULL,
+    -- 停注后是否已经出现过一次「连击中断」，用于下一次触发时自动恢复
+    streak_broken      INTEGER NOT NULL DEFAULT 0 CHECK(streak_broken IN (0,1)),
     created_at         DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     updated_at         DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE CASCADE,
     UNIQUE(rule_id, chat_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_rule_chat_state_blocked ON rule_chat_state(rule_id, blocked);
 
 -- ═══════════════════════════════════════════
 -- message_logs（开奖流水）
@@ -141,6 +152,8 @@ CREATE TABLE IF NOT EXISTS action_logs (
     is_win      INTEGER NULL,
     profit      REAL NULL,
     settled_at  DATETIME NULL,
+    -- 本笔下注消息在群里的 msg_id（用于把机器人的余额回复归属到本账号）
+    bet_msg_id  TEXT NULL,
     created_at  DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     FOREIGN KEY (bot_user_id) REFERENCES bot_users(bot_user_id),
     FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE SET NULL
@@ -148,6 +161,7 @@ CREATE TABLE IF NOT EXISTS action_logs (
 
 CREATE INDEX IF NOT EXISTS idx_action_logs_user_created ON action_logs(bot_user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_action_logs_rule ON action_logs(rule_id);
+CREATE INDEX IF NOT EXISTS idx_action_logs_bet_msg ON action_logs(chat_id, bet_msg_id);
 
 -- ═══════════════════════════════════════════
 -- operation_logs（操作日志）

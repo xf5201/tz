@@ -60,7 +60,9 @@ class RulePanel {
         const losses = states.map((s) => s.consecutive_losses);
         const pending = states.filter((s) => s.pending_direction).length;
         const armed = states.filter((s) => s.armed_direction).length;
-        text += `   各群连败 ${Math.max(...losses)}（最多）｜待发 ${armed} 群｜挂起 ${pending} 群\n`;
+        const blocked = states.filter((s) => s.blocked).length;
+        text += `   各群连败 ${Math.max(...losses)}（最多）｜待发 ${armed} 群｜挂起 ${pending} 群`;
+        text += blocked > 0 ? `｜⛔ 停注 ${blocked} 群\n` : '\n';
       }
       text += '\n';
       buttons.push([Markup.button.callback(

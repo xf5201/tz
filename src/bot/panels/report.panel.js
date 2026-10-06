@@ -58,7 +58,7 @@ class ReportPanel {
     return text;
   }
 
-  static buildKeyboard({ page = 0, total = 0 }) {
+  static buildKeyboard({ page = 0, total = 0, todayCount = 0 }) {
     const PAGE_SIZE = 10;
     const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
     const buttons = [];
@@ -71,6 +71,11 @@ class ReportPanel {
 
     buttons.push(
       [Markup.button.callback('🔄 刷新', 'report:main')],
+      // 今日有记录时才给清空按钮（避免空点）
+      [Markup.button.callback(
+        todayCount > 0 ? `🗑 清空今日记录（${todayCount} 条）` : '🗑 清空今日记录（无记录）',
+        'report:clear_today'
+      )],
       [Markup.button.callback('🔙 返回', 'dashboard:refresh')]
     );
     return Markup.inlineKeyboard(buttons);

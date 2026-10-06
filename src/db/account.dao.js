@@ -95,6 +95,21 @@ const accountDao = {
   },
 
   /**
+   * 写入当前余额（由机器人对本账号下注的回复消息解析得到）
+   *
+   * @param {string} botUserId
+   * @param {number} balance
+   */
+  updateBalance(botUserId, balance) {
+    const db = getConnection();
+    db.prepare(`
+      UPDATE accounts
+      SET balance = ?, balance_updated_at = datetime('now', '+8 hours')
+      WHERE bot_user_id = ?
+    `).run(balance, String(botUserId));
+  },
+
+  /**
    * 获取所有需要恢复 Session 的账号（启动流程）
    * @returns {Array}
    */

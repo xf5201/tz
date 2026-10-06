@@ -1,6 +1,7 @@
 // src/bot/panels/dashboard.panel.js
 const { Markup } = require('telegraf');
-const { maskPhone } = require('../../utils/mask.util');
+const { maskPhone, maskChatId } = require('../../utils/mask.util');
+const { formatNumber } = require('../../utils/format.util');
 
 /**
  * 主面板（DashboardPanel）
@@ -12,7 +13,9 @@ class DashboardPanel {
     return { text, keyboard };
   }
 
-  static buildText({ user, account, chats, rules, throughput, todayProfit, latestFailed }) {
+  static buildText({
+    user, account, chats, rules, throughput, todayProfit, latestFailed, blockedChats = [],
+  }) {
     let text = '🎲 <b>TG 群监听下注助手</b>\n';
     text += '━━━━━━━━━━━━━━━━━━━━\n';
     text += `👤 用户：@${user.username || user.id}\n`;
@@ -28,11 +31,30 @@ class DashboardPanel {
     text += `🔊 监听：${account.listen_enabled ? '🟢 开启' : '⚪ 已暂停'}\n`;
     text += `👥 监听群：${chats ? chats.length : 0} 个\n`;
 
+    // 当前余额（机器人对本账号下注的回复消息解析得到）
+    if (account.balance != null) {
+      const updated = account.balance_updated_at
+        ? (account.balance_updated_at.split(' ')[1] || '')
+        : '';
+      text += `💳 当前余额：<b>${formatNumber(account.balance)}</b>${updated ? `（${updated}）` : ''}\n`;
+    } else {
+      text += '💳 当前余额：—（等待下注回复）\n';
+    }
+
     // 今日盈利（今日已结算注的盈亏合计）
     if (todayProfit != null) {
       const p = Number(todayProfit);
       const profitText = p > 0 ? `🟢 +${p}` : p < 0 ? `🔴 ${p}` : `${p}`;
-      text += `💰 今日盈利：${profitText}\n`;
+      text += `📈 今日盈利：${profitText}\n`;
+    }
+
+    // 被单独停注的群（连败 / 止损达上限，等下次触发自动恢复）
+    if (blockedChats.length > 0) {
+      text += `⛔ 停注群：${blockedChats.length} 个（等待下次触发自动恢复）\n`;
+      for (const b of blockedChats.slice(0, 3)) {
+        text += `   ${b.chat_title || maskChatId(b.chat_id)}｜${b.blocked_reason || '已停注'}\n`;
+      }
+      if (blockedChats.length > 3) text += `   …等共 ${blockedChats.length} 个\n`;
     }
 
     if (rules && rules.length > 0) {
@@ -57,7 +79,7 @@ class DashboardPanel {
     return text;
   }
 
-  static buildKeyboard({ account }) {
+  static buildKeyboard({ account, blockedChats = [] }) {
     const buttons = [];
 
     if (!account) {
@@ -73,9 +95,15 @@ class DashboardPanel {
             account.listen_enabled ? '🔊 监听中（点击暂停）' : '🔇 已暂停（点击开启）',
             'account:listen_toggle'
           ),
-        ],
-        [Markup.button.callback('🗑️ 删除账号', 'account:delete_confirm')]
+        ]
       );
+      // 有停注群时才出现「立即恢复」（否则按钮点了没反应，徒增困惑）
+      if (blockedChats.length > 0) {
+        buttons.push([Markup.button.callback(
+          `▶️ 立即恢复 ${blockedChats.length} 个停注群`, 'dashboard:resume_chats'
+        )]);
+      }
+      buttons.push([Markup.button.callback('🗑️ 删除账号', 'account:delete_confirm')]);
     }
 
     // 公共底部按钮

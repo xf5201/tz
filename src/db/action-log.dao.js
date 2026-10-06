@@ -31,14 +31,46 @@ const actionLogDao = {
 
   /**
    * 标记已发送
+   *
+   * @param {number} id
+   * @param {string|null} actionText
+   * @param {string|number|null} betMsgId - 该笔下注消息在群里的 msg_id
+   *   （机器人的余额回复是对这条消息的回复，靠它把余额归属到本账号）
    */
-  markSent(id, actionText = null) {
+  markSent(id, actionText = null, betMsgId = null) {
     const db = getConnection();
+    if (betMsgId != null) {
+      db.prepare(`
+        UPDATE action_logs
+        SET status = 'SENT', bet_msg_id = ?${actionText != null ? ', action_text = ?' : ''}
+        WHERE id = ?
+      `).run(...(actionText != null
+        ? [String(betMsgId), actionText, id]
+        : [String(betMsgId), id]));
+      return;
+    }
     if (actionText != null) {
       db.prepare("UPDATE action_logs SET status = 'SENT', action_text = ? WHERE id = ?").run(actionText, id);
     } else {
       db.prepare("UPDATE action_logs SET status = 'SENT' WHERE id = ?").run(id);
     }
+  },
+
+  /**
+   * 按下注消息 ID 反查归属账号（余额回复归属判定）
+   *
+   * @param {string} chatId
+   * @param {string|number} msgId - 被回复的消息 ID
+   * @returns {object|undefined} 含 bot_user_id
+   */
+  getByBetMsgId(chatId, msgId) {
+    const db = getConnection();
+    if (msgId == null) return undefined;
+    return db.prepare(`
+      SELECT * FROM action_logs
+      WHERE chat_id = ? AND bet_msg_id = ?
+      ORDER BY id DESC LIMIT 1
+    `).get(String(chatId), String(msgId));
   },
 
   /**
@@ -193,6 +225,52 @@ const actionLogDao = {
           WHERE bot_user_id = ? AND profit IS NOT NULL
         `).get(String(botUserId));
     return row?.s ? Number(row.s) : 0;
+  },
+
+  /**
+   * 统计某时间点以来的记录数（清空今日前的确认文案）
+   * @param {string} botUserId
+   * @param {string} since - 'YYYY-MM-DD HH:mm:ss'
+   */
+  countSince(botUserId, since) {
+    const db = getConnection();
+    return db.prepare(`
+      SELECT COUNT(*) AS n FROM action_logs
+      WHERE bot_user_id = ? AND created_at >= ?
+    `).get(String(botUserId), since).n;
+  },
+
+  /**
+   * 删除某时间点以来的全部下注记录（清空今日记录，今日盈利随之归零）
+   *
+   * @param {string} botUserId
+   * @param {string} since - 'YYYY-MM-DD HH:mm:ss'
+   * @returns {number} 删除条数
+   */
+  deleteSince(botUserId, since) {
+    const db = getConnection();
+    return db.prepare('DELETE FROM action_logs WHERE bot_user_id = ? AND created_at >= ?')
+      .run(String(botUserId), since).changes;
+  },
+
+  /**
+   * 清空用户当前的待发 / 挂起标记
+   *
+   * 用于「清空今日记录」后：记录已被删除，若仍保留 pending，
+   * 策略执行器会因找不到可结算记录而反复自愈告警。
+   *
+   * @param {string} botUserId
+   * @returns {number} 清理的状态行数
+   */
+  clearLiveFlagsByUser(botUserId) {
+    const db = getConnection();
+    return db.prepare(`
+      UPDATE rule_chat_state
+      SET armed_direction = NULL, pending_direction = NULL,
+          updated_at = datetime('now', '+8 hours')
+      WHERE (armed_direction IS NOT NULL OR pending_direction IS NOT NULL)
+        AND rule_id IN (SELECT id FROM rules WHERE bot_user_id = ?)
+    `).run(String(botUserId)).changes;
   },
 
   /**
