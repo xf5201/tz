@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -e
-cd ~/tz
+# 切到脚本所在目录（Termux 上即 ~/tz，Windows 上即项目目录）
+cd "$(dirname "$0")"
 
 NOTES="改动说明.md"
 

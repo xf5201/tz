@@ -225,7 +225,55 @@ function getReplyToMsgId(message) {
 }
 
 /**
- * 解析结算消息：开奖点数 + 用登录账号的用户 ID 匹配本账号的输赢
+ * 解析开盘/播报消息中的期号（「期号: xxx」）
+ *
+ * 开盘消息与下注成功播报都带期号：
+ *   期号: eba8f9014fbf5320171ffbcd2f16fc7b
+ * 期号是「注单 ↔ 开奖」的唯一关联键：下注时记下所属期号，
+ * 结算只认同期的开奖点数，杜绝拿别期名单判输赢。
+ *
+ * @param {string|null} text
+ * @returns {string|null} 期号；解析不到返回 null
+ */
+function parseWindowPeriod(text) {
+  const m = String(text || '').match(/期号[:：]\s*([A-Za-z0-9]+)/);
+  return m ? m[1] : null;
+}
+
+/**
+ * 从结算消息名单提取 大/小 的赔率样本（赢金额 ÷ 投注额）
+ *
+ * 获胜行形如：　久遇 【8872785955】 大 300,赢 285 💰
+ * → 赔率样本 = 285 / 300 = 0.95
+ *
+ * 只取「大/小」行（本系统只下大小）；组合（大单/大双…）、特码、单双
+ * 赔率不同，一律排除。样本用于按群动态维护赔率（chat_odds）。
+ *
+ * @param {string|null} text - 结算消息文本
+ * @returns {number[]} 赔率样本列表（如 [0.95]）
+ */
+function parseOddsSamples(text) {
+  const raw = String(text || '');
+  if (!raw.includes('期输赢')) return [];
+
+  const samples = [];
+  for (const line of raw.split('\n')) {
+    const m = line.match(/【\d+】\s*(?:大|小)\s*([\d,]+(?:\.\d+)?)\s*,\s*赢\s*([\d,]+(?:\.\d+)?)/);
+    if (!m) continue;
+    const stake = parseFloat(m[1].replace(/,/g, ''));
+    const win = parseFloat(m[2].replace(/,/g, ''));
+    if (!(stake > 0) || !(win > 0)) continue;
+    const odds = win / stake;
+    // 大/小赔率必然在 (0, 2) 区间（0.95 左右），越界视为解析噪声
+    if (odds > 0 && odds <= 2) {
+      samples.push(Math.round(odds * 10000) / 10000);
+    }
+  }
+  return samples;
+}
+
+/**
+ * 解析结算消息：期号 + 开奖点数 + 用登录账号的用户 ID 匹配本账号的输赢
  *
  * 获胜行形如：　奔驰 迈巴赫 【7016374749】 大 5,赢 4.75 💰
  * 无获奖时为：　本期无获奖用户
@@ -233,6 +281,7 @@ function getReplyToMsgId(message) {
  * @param {string|null} text - 结算消息文本
  * @param {string} userId - 登录账号的 TG 用户 ID
  * @returns {{
+ *   period: string|null,    // 结算期号（「第xxx期输赢」中的 xxx）
  *   diceValue: number|null,
  *   matched: boolean,       // 结算名单中是否出现本账号
  *   isWin: boolean|null,    // matched 时才有意义
@@ -241,6 +290,8 @@ function getReplyToMsgId(message) {
  */
 function parseSettle(text, userId) {
   const raw = String(text || '');
+  const periodMatch = raw.match(/第\s*([A-Za-z0-9]+)\s*期输赢/);
+  const period = periodMatch ? periodMatch[1] : null;
   const diceMatch = raw.match(/骰子为[:：]\s*(\d+)/);
   const diceValue = diceMatch ? parseInt(diceMatch[1], 10) : null;
 
@@ -249,7 +300,7 @@ function parseSettle(text, userId) {
     .find((line) => line.includes(`【${userId}】`));
 
   if (!meLine) {
-    return { diceValue, matched: false, isWin: null, profit: null };
+    return { period, diceValue, matched: false, isWin: null, profit: null };
   }
 
   // 行内同时含「赢」与「输」时按出现位置判断
@@ -267,13 +318,15 @@ function parseSettle(text, userId) {
     isWin = false;
   }
 
-  return { diceValue, matched: true, isWin, profit: Number.isFinite(profit) ? profit : null };
+  return { period, diceValue, matched: true, isWin, profit: Number.isFinite(profit) ? profit : null };
 }
 
 module.exports = {
   parseDiceMessage,
   isSettleMessage,
   parseSettle,
+  parseWindowPeriod,
+  parseOddsSamples,
   isBalanceMessage,
   parseBalance,
   parseBetResult,
