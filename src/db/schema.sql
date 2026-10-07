@@ -150,8 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_message_logs_chat_created ON message_logs(chat_id
 -- ═══════════════════════════════════════════
 -- action_logs（下注记录）
 -- 状态：CREATED | SENT | FAILED | DRY_RUN
--- 结算：按本群机器人开奖点数直接判定（大=4-6 赢 / 小=1-3 赢），
---       盈利用本群动态赔率（chat_odds）计算；round_period 锁定所属期号
+-- 结算：输赢从群内「❤️第xxx期输赢」消息按用户 ID 匹配解析
 -- ═══════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS action_logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,8 +169,6 @@ CREATE TABLE IF NOT EXISTS action_logs (
     settled_at  DATETIME NULL,
     -- 本笔下注消息在群里的 msg_id（用于把机器人的余额回复归属到本账号）
     bet_msg_id  TEXT NULL,
-    -- 注单所属期号（下注时从开盘消息取得；结算只认同期点数）
-    round_period TEXT NULL,
     created_at  DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     FOREIGN KEY (bot_user_id) REFERENCES bot_users(bot_user_id),
     FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE SET NULL
@@ -180,18 +177,6 @@ CREATE TABLE IF NOT EXISTS action_logs (
 CREATE INDEX IF NOT EXISTS idx_action_logs_user_created ON action_logs(bot_user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_action_logs_rule ON action_logs(rule_id);
 CREATE INDEX IF NOT EXISTS idx_action_logs_bet_msg ON action_logs(chat_id, bet_msg_id);
-CREATE INDEX IF NOT EXISTS idx_action_logs_chat_period ON action_logs(chat_id, round_period);
-
--- ═══════════════════════════════════════════
--- chat_odds（按群动态学习的大/小赔率）
--- 来源：结算名单中奖行 赢金额÷投注额（增量平均，抑制单条噪声）
--- ═══════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS chat_odds (
-    chat_id      TEXT PRIMARY KEY,
-    odds         REAL NOT NULL,
-    sample_count INTEGER NOT NULL DEFAULT 0,
-    updated_at   DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours'))
-);
 
 -- ═══════════════════════════════════════════
 -- operation_logs（操作日志）

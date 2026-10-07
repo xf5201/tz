@@ -15,8 +15,8 @@ const actionLogDao = {
   insert(data) {
     const db = getConnection();
     const info = db.prepare(`
-      INSERT INTO action_logs (bot_user_id, rule_id, chat_id, direction, bet_amount, action_text, status, round_period)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO action_logs (bot_user_id, rule_id, chat_id, direction, bet_amount, action_text, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
       String(data.bot_user_id),
       data.rule_id ?? null,
@@ -24,34 +24,9 @@ const actionLogDao = {
       data.direction,
       data.bet_amount,
       data.action_text,
-      data.status || 'CREATED',
-      data.round_period ?? null
+      data.status || 'CREATED'
     );
     return info.lastInsertRowid;
-  },
-
-  /**
-   * 按 ID 取动作记录
-   * @param {number} id
-   * @returns {object|undefined}
-   */
-  getById(id) {
-    const db = getConnection();
-    return db.prepare('SELECT * FROM action_logs WHERE id = ?').get(id);
-  },
-
-  /**
-   * 回写注单所属期号（下注成功播报里带期号，用于修正/补全）
-   * 仅在原本为空时写入，不覆盖已有值（下注时的开盘期号优先）
-   * @param {number} id
-   * @param {string} period
-   * @returns {number}
-   */
-  updateRoundPeriodIfEmpty(id, period) {
-    const db = getConnection();
-    return db.prepare(`
-      UPDATE action_logs SET round_period = ? WHERE id = ? AND round_period IS NULL
-    `).run(String(period), id).changes;
   },
 
   /**
@@ -254,28 +229,6 @@ const actionLogDao = {
           WHERE bot_user_id = ? AND profit IS NOT NULL
         `).get(String(botUserId));
     return row?.s ? Number(row.s) : 0;
-  },
-
-  /**
-   * 用结算名单里的精确盈亏修正已结算注单的盈利（同群同期号的赢单）
-   *
-   * 常规结算用「点数 × 群赔率」估算盈利；结算名单里若出现本账号的中奖行，
-   * 金额是游戏方给出的精确值，用它覆盖估算值（仅修正赢单，输单=本金无需修正）。
-   *
-   * @param {string} botUserId
-   * @param {string} chatId
-   * @param {string} period - 结算期号
-   * @param {number} profit - 名单中解析出的净盈利
-   * @returns {number} 实际修正的行数
-   */
-  refineWinProfit(botUserId, chatId, period, profit) {
-    const db = getConnection();
-    return db.prepare(`
-      UPDATE action_logs
-      SET profit = ?
-      WHERE bot_user_id = ? AND chat_id = ? AND round_period = ?
-        AND is_win = 1 AND settled_at IS NOT NULL AND profit != ?
-    `).run(Number(profit), String(botUserId), String(chatId), String(period), Number(profit)).changes;
   },
 
   /**

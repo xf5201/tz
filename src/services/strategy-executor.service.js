@@ -5,12 +5,11 @@ const ruleStateDao = require('../db/rule-state.dao');
 const messageLogDao = require('../db/message-log.dao');
 const actionLogDao = require('../db/action-log.dao');
 const operationLogDao = require('../db/operation-log.dao');
-const chatOddsDao = require('../db/chat-odds.dao');
 const { transaction } = require('../db/connection');
 const {
-  evaluateStreak, calcAmount, calcCumulativeStake, buildBetText, isBalanceInsufficient, sizeOf,
+  evaluateStreak, calcAmount, calcCumulativeStake, buildBetText, isBalanceInsufficient,
 } = require('../core/rule.engine');
-const { parseSettle, parseWindowPeriod } = require('../core/dice.parser');
+const { parseSettle } = require('../core/dice.parser');
 const {
   calcRoundProfit, isTakeProfitReached, isBaselineStale, beijingDate,
 } = require('../core/profit.guard');
@@ -33,25 +32,18 @@ const BET_WINDOW_KEYWORD = '底注:1u';
 // 会让该「规则 × 群」永久不再判定、不再下注。
 const ARMED_TTL_MS = 3 * 60 * 1000;
 
-// 挂起（pending）超时：下注后若长时间等不到开奖点数（骰子消息丢失 /
+// 挂起（pending）超时：下注后若长时间等不到结算消息（结算消息丢失 /
 // 群消息改版），挂起会永久卡住该「规则 × 群」。巡检兜底超过该时长即解除并告警。
 const PENDING_TTL_MS = 10 * 60 * 1000;
 
 // 发送在途保护窗口（秒）：下注消息发送超时 30s + 两次退避重试（2s/8s）+ 重试发送
 // 最长约 100s。窗口内存在 CREATED 动作说明发送还在进行，
-// 此刻开奖到达不能清挂起，否则发送完成后该注永远等不到结算（漏结算）。
+// 此刻结算消息到达不能清挂起，否则发送完成后该注永远等不到结算（漏结算）。
 const SEND_IN_FLIGHT_GUARD_SECONDS = 120;
 
 // 连击中断后是否清零连败：连败只在「同一条倍投链」内有意义，
 // 连击断了 = 这条链结束，新一轮应从基础金额重新开始。
 const RESET_LOSSES_ON_CHAIN_BREAK = true;
-
-// 默认赔率（大/小 1:0.95）：群内还没学到任何结算名单样本时用它估算赢单盈利，
-// 学到样本后（chat_odds）按群动态赔率计算；名单里出现本账号时再修正为精确值。
-const DEFAULT_PAYOUT_ODDS = 0.95;
-
-// 每群在内存里保留的最近骰子条数（发送在途补结算 / 开盘兜底结算用）
-const DICE_HISTORY_SIZE = 6;
 
 /**
  * 判断消息是否为下注窗口开盘信号（识别到底注：1u）
@@ -68,29 +60,9 @@ function isBetWindowMessage(text) {
 }
 
 /**
- * 把 DB 里的北京时间字符串（'YYYY-MM-DD HH:mm:ss'）转为 epoch 毫秒
- * @param {string|null} beijingStr
- * @returns {number|null}
- */
-function beijingTimeToMs(beijingStr) {
-  if (!beijingStr) return null;
-  const ms = Date.parse(String(beijingStr).replace(' ', 'T') + '+08:00');
-  return Number.isFinite(ms) ? ms : null;
-}
-
-/**
- * 策略执行器（动态监测 + 底注闸门 + 开奖点数直接判输赢）
+ * 策略执行器（动态监测 + 底注闸门 + 结算消息判输赢）
  *
  * 状态流转：无 → armed(待发) → pending(已发待结算) → 无（或连败后重新 armed）
- *
- * 输赢判定模型（2026-10 改造）：
- *   - 开奖点数以机器人发出的骰子消息（MessageMediaDice）为准，
- *     大=4-6 / 小=1-3，与本方下注方向比对即得输赢，不再依赖
- *     「第xxx期输赢」名单里的用户 ID 匹配（名单丢失会错判，见 1525 案例）。
- *   - 赢单盈利 = 下注金额 × 群赔率（chat_odds，从各群历史结算名单动态学习，
- *     无样本用默认 0.95）；结算名单里恰好有本账号时修正为精确值。
- *   - 每笔下注记录所属期号（round_period），结算消息只处理同期的注单；
- *     骰子消息错过时，下一期开盘信号到达就用已捕获的骰子兜底结算。
  *
  * 修复要点（原实现的四个缺陷）：
  *   1. 结算后重新待发用了过期 state 快照 → 每轮都跳过一轮，倍投链被腰斩
@@ -111,39 +83,26 @@ class StrategyExecutorService {
     // 运行时限流状态（内存即可，重启清零）
     this._lastActionAt = new Map();  // "userId:chatId:ruleId" → ts
     this._rateWindow = new Map();    // "userId:chatId:ruleId" → number[] 时间戳窗口
-
-    // 每群回合追踪（内存，重启后由下一条开盘消息/骰子重建）：
-    //   _chatRounds  chatId → { period, atMs }   最近一次开盘信号的期号与到达时间
-    //   _diceHistory chatId → [{ value, period, msgId, capturedAtMs }] 最近的骰子（新→旧）
-    this._chatRounds = new Map();
-    this._diceHistory = new Map();
   }
 
   /**
-   * 开奖消息入口（骰子）：结算挂起注单 → 触发判定 → 待发
-   *
-   * 骰子消息就是开奖本身：挂起中的实发注在这里直接用点数判定输赢，
-   * 不再等「第xxx期输赢」结算名单（名单丢失/改版不再影响输赢判定）。
+   * 开奖消息入口（骰子）：触发判定 → 待发
    */
   async handleOpen(botUserId, chatId, dice) {
     const account = accountDao.getActive(botUserId);
     if (!account || account.status !== 'ACTIVE') return;
 
+    // 今日已达标止盈 → 停止运行，等用户手动恢复
+    if (account.profit_stopped === 1) return;
+
     const rules = ruleDao.listEnabledByUser(botUserId);
     if (rules.length === 0) return;
 
-    // 记录本群最新骰子：发送在途的注单确认后要靠它补结算，
-    // 开盘信号到达时的兜底结算也要用它
-    const diceEntry = this._rememberDice(chatId, dice);
-
-    // 止盈停止 / 余额见底：已投出去的注仍要正常结算，
-    // 只是不再触发新一轮待发（arm / 停注群恢复评估）
-    const canArm = account.profit_stopped !== 1 && !this.isBalanceDepleted(account, rules);
+    // 余额见底 → 不再进入待发（省得待发后又因余额不足被拒）
+    if (this.isBalanceDepleted(account, rules)) return;
 
     const armedRules = [];
     const resumedChats = [];
-    const blockedChats = [];
-    let settledCount = 0;
 
     transaction(() => {
       for (const rule of rules) {
@@ -154,18 +113,7 @@ class StrategyExecutorService {
           );
         }
 
-        let state = ruleStateDao.ensure(rule.id, chatId);
-
-        // ── 先结算：挂起中的实发注，直接用本条开奖点数判定 ──
-        // 结算会更新连败数，必须先于下面的触发判定与连败清零
-        if (state.pending_direction) {
-          settledCount += this._settlePendingWithDice(
-            botUserId, rule, chatId, diceEntry, state, blockedChats
-          );
-          state = ruleStateDao.ensure(rule.id, chatId);
-        }
-
-        if (!canArm) continue;
+        const state = ruleStateDao.ensure(rule.id, chatId);
 
         // 本群已单独停注：不下注，只观察连击是否重新满足（满足则自动恢复）
         if (state.blocked) {
@@ -176,7 +124,7 @@ class StrategyExecutorService {
           continue;
         }
 
-        // 待发 / 挂起期间不重复触发
+        // 待发 / 挂起期间不重复触发（挂起由结算消息处理）
         if (state.armed_direction || state.pending_direction) continue;
 
         const armed = this._tryArm(botUserId, rule, chatId, dice.value, armedRules);
@@ -191,9 +139,20 @@ class StrategyExecutorService {
       }
     });
 
-    await this._afterSettlement(botUserId, {
-      settledCount, armedRules, resumedChats, blockedChats,
-    });
+    // 停注群自动恢复通知
+    for (const chat of resumedChats) {
+      if (this.notification) {
+        await this.notification.notifyEvent(
+          botUserId,
+          `▶️ 规则「${chat.rule.name || chat.rule.id}」@${maskChatId(chat.chatId)} ` +
+            `连击重新满足，已自动恢复下注（连败已清零）。`
+        ).catch(() => {});
+      }
+    }
+
+    if ((armedRules.length > 0 || resumedChats.length > 0) && this.notification) {
+      await this.notification.pushToUser(botUserId).catch(() => {});
+    }
 
     return armedRules.length;
   }
@@ -203,18 +162,8 @@ class StrategyExecutorService {
    *
    * 关键：只有「发送成功」才置 pending，失败则清掉 armed（本轮放弃），
    * 避免 pending 卡死导致该规则 × 群永久不再下注。
-   *
-   * 另外两件事：
-   *   1. 记录本期期号（开盘消息带「期号: xxx」），作为注单 ↔ 开奖的关联键
-   *   2. 兜底结算：上一期的骰子与结算消息都被错过、而本期开盘信号已到时，
-   *      用已捕获的骰子（注单创建后到达的第一条）判定上期挂起注的输赢，
-   *      不让挂起跨期滞留（没等到上期开奖信息 + 新开盘信号已到 → 用已获取的信息判定）
-   *
-   * @param {string} botUserId
-   * @param {string} chatId
-   * @param {string|null} text - 开盘消息文本（用于解析期号）
    */
-  async handleRoundOpen(botUserId, chatId, text) {
+  async handleRoundOpen(botUserId, chatId) {
     const account = accountDao.getActive(botUserId);
     if (!account || account.status !== 'ACTIVE') return;
 
@@ -232,13 +181,7 @@ class StrategyExecutorService {
       return;
     }
 
-    // 记录本期期号（解析不到时为 null，后续结算按无期号兼容处理）
-    const period = parseWindowPeriod(text);
-    this._chatRounds.set(chatId, { period, atMs: Date.now() });
-
     const candidates = [];
-    const blockedChats = [];
-    let settledCount = 0;
 
     transaction(() => {
       for (const rule of rules) {
@@ -248,18 +191,10 @@ class StrategyExecutorService {
           );
         }
 
-        let state = ruleStateDao.ensure(rule.id, chatId);
+        const state = ruleStateDao.ensure(rule.id, chatId);
 
         // 本群已单独停注（连败/止损达上限）→ 不下注，等连击重新满足自动恢复
         if (state.blocked) continue;
-
-        // ── 兜底结算：上期挂起注在此了结（详见方法注释） ──
-        if (state.pending_direction) {
-          settledCount += this._sweepPendingAtRoundOpen(
-            botUserId, rule, chatId, blockedChats
-          );
-          state = ruleStateDao.ensure(rule.id, chatId);
-        }
 
         // 只有「待发」状态才下注
         if (!state.armed_direction || state.pending_direction) continue;
@@ -287,7 +222,6 @@ class StrategyExecutorService {
           bet_amount: amount,
           action_text: actionText,
           status: isDry ? 'DRY_RUN' : 'CREATED',
-          round_period: period,
         });
 
         // 立即占位（事务内）：清 armed、置 pending。
@@ -356,10 +290,6 @@ class StrategyExecutorService {
       }
     }
 
-    await this._afterSettlement(botUserId, {
-      settledCount, armedRules: [], resumedChats: [], blockedChats,
-    });
-
     if (candidates.length > 0 && this.notification) {
       await this.notification.pushToUser(botUserId).catch(() => {});
     }
@@ -368,14 +298,9 @@ class StrategyExecutorService {
   }
 
   /**
-   * 结算消息入口（❤️第xxx期输赢）
-   *
-   * 输赢判定已改为「开奖点数直接判定」（见类注释），结算消息降级为三个角色：
-   *   1. 赔率学习：名单中奖行（赢÷投注额）→ chat_odds（分发器统一做，每消息一次）
-   *   2. 兜底结算：某期骰子消息被错过时，该期挂起注用结算消息里的
-   *      「骰子为: N」点数判定 —— 但期号必须与注单一致，绝不再拿别期名单判输赢
-   *      （1525 错判的根因：上一期结算消息丢失 → 下一期名单里没有本账号 → 误记输）
-   *   3. 盈利修正：名单里出现本账号的中奖行 → 把估算盈利修正为精确值
+   * 结算消息入口（❤️第xxx期输赢）：
+   * 解析开奖点数与本账号输赢（用户 ID 匹配），更新连败/止损，
+   * 结算完成后立即用该条开奖点数评估是否进入下一轮「待发」。
    *
    * @param {string} botUserId
    * @param {string} chatId
@@ -398,7 +323,7 @@ class StrategyExecutorService {
       for (const rule of rules) {
         let state = ruleStateDao.ensure(rule.id, chatId);
 
-        // ── 实发注兜底结算：骰子消息被错过时，用同期结算消息里的点数判定 ──
+        // ── 实发注：按结算名单匹配本账号判定输赢 ──
         if (state.pending_direction) {
           const pending = actionLogDao.getLatestUnsettledSent(rule.id, chatId);
 
@@ -419,31 +344,72 @@ class StrategyExecutorService {
                 `[STRATEGY_EXEC] 挂起状态无对应已发记录，已自愈清除: 规则=${rule.id}, 群=${maskChatId(chatId)}`
               );
             }
-          } else if (pending.round_period && settle.period
-            && pending.round_period !== settle.period) {
-            // ── 期号不一致：这注不属于本期，绝不用别期点数/名单判它 ──
-            // 等它自己那期的骰子消息或结算消息，或超时巡检兜底
-            logger.info(
-              `[STRATEGY_EXEC] 结算期号=${settle.period} 与挂起注单期号=${pending.round_period} ` +
-              `不一致，跳过（等待同期开奖）: 规则=${rule.id}, 群=${maskChatId(chatId)}, 动作=${pending.action_text}`
-            );
-          } else if (settle.diceValue != null) {
-            // 名单里有本账号 → 用名单精确盈亏；否则按群赔率估算
-            const isWin = this._judgeWin(pending.direction, settle.diceValue);
-            const profit = (settle.matched && settle.isWin && settle.profit != null)
-              ? settle.profit
-              : (isWin ? this._winProfit(chatId, pending.bet_amount) : -pending.bet_amount);
-            settledCount += this._applySettlement(
-              botUserId, rule, chatId, pending, settle.diceValue, isWin, profit,
-              state, blockedChats, '结算消息'
-            );
+          } else {
+            let isWin;
+            let profit;
+            if (settle.matched) {
+              isWin = settle.isWin ? 1 : 0;
+              if (settle.isWin) {
+                profit = settle.profit != null ? settle.profit : null; // 赢：消息里的净盈利
+              } else {
+                profit = settle.profit != null ? settle.profit : -pending.bet_amount; // 输：亏本金
+              }
+            } else {
+              // 结算名单没有本账号 → 输（输掉本金）
+              isWin = 0;
+              profit = -pending.bet_amount;
+            }
+
+            const changed = actionLogDao.markSettled(pending.id, isWin, profit);
+            if (changed) {
+              const newLosses = isWin ? 0 : state.consecutive_losses + 1;
+              ruleStateDao.updateState(rule.id, chatId, {
+                consecutiveLosses: newLosses,
+                pendingDirection: null,
+              });
+              settledCount++;
+
+              logger.info(
+                `[STRATEGY_EXEC] 结算: 规则=${rule.id}, 群=${maskChatId(chatId)}, ` +
+                `方向=${state.pending_direction}, 点数=${settle.diceValue}, ` +
+                `${isWin ? '赢' : '输'}${profit != null ? ` 盈亏=${profit}` : ''}, 连败=${newLosses}`
+              );
+              operationLogDao.insert({
+                bot_user_id: botUserId,
+                action: 'BET_SETTLED',
+                detail: `规则「${rule.name || rule.id}」@${maskChatId(chatId)} ` +
+                  `${isWin ? '赢' : '输'}${profit != null ? ` ${profit}` : ''}，连败 ${newLosses}`,
+              });
+
+              // 止损硬约束：连败上限
+              // 只停「这个群」—— 规则本身继续在别的群运行，
+              // 本群等连击中断后下一次触发自动恢复（连败清零）
+              if (newLosses >= rule.max_lose_streak) {
+                const reason = `连续未中 ${newLosses} 次，已达连败上限 ${rule.max_lose_streak}`;
+                ruleStateDao.blockChat(rule.id, chatId, reason);
+                blockedChats.push({ rule, chatId, reason });
+                continue;
+              }
+              // 止损硬约束：累计投入（只算「已经真实投出去的钱」，不再多算下一注）
+              if (rule.stop_loss != null) {
+                const spent = calcCumulativeStake(
+                  rule.base_bet, rule.martingale_ratio, Math.max(0, newLosses - 1)
+                );
+                if (spent >= rule.stop_loss) {
+                  const reason = `累计投入 ${spent} 已达止损上限 ${rule.stop_loss}`;
+                  ruleStateDao.blockChat(rule.id, chatId, reason);
+                  blockedChats.push({ rule, chatId, reason });
+                  continue;
+                }
+              }
+            }
           }
         } else {
-          // ── 模拟注：按开奖点数判定输赢（不产生盈亏金额；期号不一致则跳过） ──
+          // ── 模拟注：按结算消息中的开奖点数判定输赢（不产生盈亏金额） ──
           const dry = actionLogDao.getLatestUnsettledDry(rule.id, chatId);
-          if (dry && settle.diceValue != null
-            && (!dry.round_period || !settle.period || dry.round_period === settle.period)) {
-            const isWin = this._judgeWin(dry.direction, settle.diceValue);
+          if (dry && settle.diceValue != null) {
+            const win = settle.diceValue >= 4 ? 'BIG' : 'SMALL';
+            const isWin = win === dry.direction ? 1 : 0;
             if (actionLogDao.markSettled(dry.id, isWin, null)) {
               settledCount++;
               logger.info(
@@ -455,8 +421,6 @@ class StrategyExecutorService {
         }
 
         // ── 结算后立即用该条开奖点数评估下一轮「待发」──
-        // 正常流程里骰子消息已先到、已在 handleOpen 里评估过（armed/pending 非空则跳过）；
-        // 骰子被错过时，这里是唯一的评估时机。
         // 关键修复：必须重新读一次状态，原代码用的是函数开头拿到的过期快照
         // （state.pending_direction 仍是旧值），导致这里永远进不来，
         // 结果「每次结算后都要空过一轮」，倍投链直接被腰斩。
@@ -471,47 +435,8 @@ class StrategyExecutorService {
       }
     });
 
-    // 名单里有本账号的中奖行 → 把本期已结算赢单的估算盈利修正为精确值
-    if (settle.matched && settle.isWin && settle.profit != null && settle.period) {
-      const refined = actionLogDao.refineWinProfit(botUserId, chatId, settle.period, settle.profit);
-      if (refined > 0) {
-        logger.info(
-          `[STRATEGY_EXEC] 盈利已按名单修正: 群=${maskChatId(chatId)}, 期=${settle.period}, ` +
-          `盈亏→${settle.profit}（${refined} 笔）`
-        );
-      }
-    }
-
-    await this._afterSettlement(botUserId, {
-      settledCount, armedRules, resumedChats: [], blockedChats,
-    });
-
-    return settledCount;
-  }
-
-  /**
-   * 结算/恢复后的统一收尾：停注群通知、自动恢复通知、止盈检查、面板推送
-   * @param {string} botUserId
-   * @param {object} p
-   * @param {number} p.settledCount - 本次结算的注单数
-   * @param {Array} p.armedRules - 本次进入待发的规则
-   * @param {Array} p.resumedChats - 本次自动恢复的停注群
-   * @param {Array} p.blockedChats - 本次被停注的群
-   */
-  async _afterSettlement(botUserId, { settledCount, armedRules, resumedChats, blockedChats }) {
-    // 停注群自动恢复通知
-    for (const chat of resumedChats || []) {
-      if (this.notification) {
-        await this.notification.notifyEvent(
-          botUserId,
-          `▶️ 规则「${chat.rule.name || chat.rule.id}」@${maskChatId(chat.chatId)} ` +
-            `连击重新满足，已自动恢复下注（连败已清零）。`
-        ).catch(() => {});
-      }
-    }
-
     // 单群停注通知（规则仍在别的群继续运行）
-    for (const { rule, chatId, reason } of blockedChats || []) {
+    for (const { rule, chatId, reason } of blockedChats) {
       operationLogDao.insert({
         bot_user_id: botUserId,
         action: 'CHAT_AUTO_BLOCKED',
@@ -530,305 +455,18 @@ class StrategyExecutorService {
       }
     }
 
-    // 结算会让今日盈利变化 → 有结算就检查是否达到止盈目标
+    // 结算会让今日盈利变化 → 每次结算后检查是否达到止盈目标
     if (settledCount > 0) {
       await this.checkTakeProfit(botUserId).catch((err) => logger.error(
         `[STRATEGY_EXEC] checkTakeProfit 异常: 用户=${botUserId}, ${err.message}`
       ));
     }
 
-    if ((settledCount > 0 || armedRules.length > 0 || blockedChats.length > 0
-      || (resumedChats && resumedChats.length > 0)) && this.notification) {
+    if ((settledCount > 0 || armedRules.length > 0 || blockedChats.length > 0) && this.notification) {
       await this.notification.pushToUser(botUserId).catch(() => {});
     }
-  }
 
-  /**
-   * 记录本群最新骰子（开奖消息入口调用）
-   * 保留最近 DICE_HISTORY_SIZE 条：发送在途的注单确认后按期号/时间补结算用
-   * 多账号共听同一群时同一条骰子会分发多次，按 msg_id 去重只记一次
-   *
-   * @returns {object} 本次开奖的完整记录 { value, period, msgId, capturedAtMs }
-   */
-  _rememberDice(chatId, dice) {
-    const history = this._diceHistory.get(chatId) || [];
-    if (history[0] && String(history[0].msgId) === String(dice.msgId)) return history[0];
-    const round = this._chatRounds.get(chatId) || null;
-    const entry = {
-      value: dice.value,
-      period: round ? round.period : null,
-      msgId: dice.msgId,
-      capturedAtMs: Date.now(),
-    };
-    history.unshift(entry);
-    if (history.length > DICE_HISTORY_SIZE) history.length = DICE_HISTORY_SIZE;
-    this._diceHistory.set(chatId, history);
-    return entry;
-  }
-
-  /**
-   * 点数判输赢：大=4-6 / 小=1-3，与下注方向比对
-   * @param {string} direction - 'BIG'|'SMALL'
-   * @param {number} diceValue - 1-6
-   * @returns {0|1}
-   */
-  _judgeWin(direction, diceValue) {
-    return sizeOf(diceValue) === direction ? 1 : 0;
-  }
-
-  /**
-   * 群赔率（无样本时用默认值）
-   */
-  _oddsFor(chatId) {
-    const learned = chatOddsDao.getOdds(chatId);
-    return learned != null ? learned : DEFAULT_PAYOUT_ODDS;
-  }
-
-  /**
-   * 赢单盈利估算：下注金额 × 群赔率（保留两位）
-   */
-  _winProfit(chatId, betAmount) {
-    return Math.round(Number(betAmount) * this._oddsFor(chatId) * 100) / 100;
-  }
-
-  /**
-   * 找到某笔下注所属期的骰子：注单创建之后捕获的第一条骰子就是它那期的开奖
-   *
-   * 期号校验：双方期号都已知且不一致 → 不匹配（该期骰子没被捕获到，宁可等也不猜）
-   *
-   * @param {string} chatId
-   * @param {number} betMs - 注单创建时间（epoch ms）
-   * @param {string|null} period - 注单期号（未知传 null）
-   * @returns {object|null} { value, period, msgId, capturedAtMs }
-   */
-  _findDiceForBet(chatId, betMs, period) {
-    if (betMs == null) return null;
-    const history = this._diceHistory.get(chatId) || [];
-    const after = history.filter((d) => d.capturedAtMs > betMs); // 新→旧
-    if (after.length === 0) return null;
-    if (period) {
-      // 期号已知：只认同期骰子（历史里 newest→oldest，先查最新的，回溯到最早）
-      const matched = after.filter((d) => d.period === period);
-      return matched.length ? matched[matched.length - 1] : null;
-    }
-    // 期号未知（重启后还没见过开盘消息）：取创建后最早的一条 = 该注所属期。
-    // 但若注单老到早于捕获窗口里最旧的一条骰子，它所属期的骰子已不在窗口内，
-    // 「最早的一条」其实是更晚的期 —— 宁可留着等超时巡检，也不跨期猜
-    const oldest = history[history.length - 1];
-    if (oldest && betMs < oldest.capturedAtMs) return null;
-    return after[after.length - 1];
-  }
-
-  /**
-   * 开奖点数结算挂起注单（骰子消息入口调用，需在事务内）
-   *
-   * @returns {number} 结算的注单数（0 或 1）
-   */
-  _settlePendingWithDice(botUserId, rule, chatId, dice, state, blockedChats) {
-    const pending = actionLogDao.getLatestUnsettledSent(rule.id, chatId);
-
-    if (!pending) {
-      // 自愈：挂起但没有可结算的已发记录。发送在途保护窗口内不清（正在发送，
-      // 确认后由 handleBetConfirmed 补结算）；否则清掉（发送失败遗留）
-      const inFlight = actionLogDao.getRecentCreated(rule.id, chatId, SEND_IN_FLIGHT_GUARD_SECONDS);
-      if (inFlight) {
-        logger.info(
-          `[STRATEGY_EXEC] 开奖到达但下注仍在发送中，等发送确认后补结算: ` +
-          `规则=${rule.id}, 群=${maskChatId(chatId)}, 动作=${inFlight.action_text}`
-        );
-        return 0;
-      }
-      ruleStateDao.updateState(rule.id, chatId, { pendingDirection: null });
-      logger.warn(
-        `[STRATEGY_EXEC] 挂起状态无对应已发记录，已自愈清除: 规则=${rule.id}, 群=${maskChatId(chatId)}`
-      );
-      return 0;
-    }
-
-    const betMs = beijingTimeToMs(pending.created_at);
-    const round = this._chatRounds.get(chatId);
-
-    // 跨期保护：注单早于当前开盘窗口 → 它属于上一期（上期开奖被完整错过），
-    // 不能用本期点数判它（留给结算消息期号匹配 / 超时巡检）
-    if (round && betMs != null && betMs < round.atMs) {
-      logger.warn(
-        `[STRATEGY_EXEC] 挂起注单早于当前开盘窗口（疑似上期开奖被错过），跳过本期点数结算: ` +
-        `规则=${rule.id}, 群=${maskChatId(chatId)}, 动作=${pending.action_text}`
-      );
-      return 0;
-    }
-
-    // 期号保护：双方期号都已知且不一致 → 这条骰子不是这注的开奖
-    if (pending.round_period && dice.period
-      && pending.round_period !== dice.period) {
-      logger.warn(
-        `[STRATEGY_EXEC] 骰子期号=${dice.period} 与挂起注单期号=${pending.round_period} 不一致，跳过结算: ` +
-        `规则=${rule.id}, 群=${maskChatId(chatId)}, 动作=${pending.action_text}`
-      );
-      return 0;
-    }
-
-    const isWin = this._judgeWin(pending.direction, dice.value);
-    const profit = isWin ? this._winProfit(chatId, pending.bet_amount) : -pending.bet_amount;
-    return this._applySettlement(
-      botUserId, rule, chatId, pending, dice.value, isWin, profit,
-      state, blockedChats, '骰子'
-    );
-  }
-
-  /**
-   * 开盘信号到达时的兜底结算（需在事务内）
-   *
-   * 场景：上一期的骰子消息与结算消息都被错过（轮询窗口跳过 / 监听断档），
-   * 挂起注跨期滞留。既然本期开盘信号已到（上期已结束），就用内存里
-   * 已捕获的骰子（注单创建后到达的第一条）判定上期挂起注的输赢。
-   *
-   * @returns {number} 结算的注单数（0 或 1）
-   */
-  _sweepPendingAtRoundOpen(botUserId, rule, chatId, blockedChats) {
-    const pending = actionLogDao.getLatestUnsettledSent(rule.id, chatId);
-    if (!pending) {
-      // 自愈：无在途发送才清（与开奖路径同一规则）
-      const inFlight = actionLogDao.getRecentCreated(rule.id, chatId, SEND_IN_FLIGHT_GUARD_SECONDS);
-      if (!inFlight) {
-        ruleStateDao.updateState(rule.id, chatId, { pendingDirection: null });
-        logger.warn(
-          `[STRATEGY_EXEC] 挂起状态无对应已发记录，已自愈清除: 规则=${rule.id}, 群=${maskChatId(chatId)}`
-        );
-      }
-      return 0;
-    }
-
-    const dice = this._findDiceForBet(
-      chatId, beijingTimeToMs(pending.created_at), pending.round_period
-    );
-    if (!dice) return 0; // 没有任何已捕获点数 → 留给结算消息期号匹配 / 超时巡检
-
-    const isWin = this._judgeWin(pending.direction, dice.value);
-    const profit = isWin ? this._winProfit(chatId, pending.bet_amount) : -pending.bet_amount;
-    logger.info(
-      `[STRATEGY_EXEC] 开盘兜底结算（上期开奖消息被错过，用已捕获点数）: ` +
-      `规则=${rule.id}, 群=${maskChatId(chatId)}, 动作=${pending.action_text}, 点数=${dice.value}`
-    );
-    const state = ruleStateDao.ensure(rule.id, chatId);
-    return this._applySettlement(
-      botUserId, rule, chatId, pending, dice.value, isWin, profit,
-      state, blockedChats, '开盘兜底'
-    );
-  }
-
-  /**
-   * 下注确认成功（✅ 投注成功播报到达）后的补结算入口
-   *
-   * 常规流程：确认播报远早于开奖 → 无骰子可匹配 → 直接返回（等开奖）。
-   * 兜底流程：发送在途时开奖已到（发送太慢/重试成功）→ 该注所属期的点数
-   * 已在内存里，立即补结算，否则下一期开奖会错误地结算这期注单。
-   *
-   * @param {string} botUserId
-   * @param {string} chatId
-   * @param {object} bet - action_logs 行（getByBetMsgId 取到）
-   * @param {string} text - 播报文本（含「期号: xxx」）
-   */
-  async handleBetConfirmed(botUserId, chatId, bet, text) {
-    if (!bet || bet.rule_id == null) return;
-
-    const fresh = actionLogDao.getById(bet.id);
-    if (!fresh || fresh.status !== 'SENT' || fresh.settled_at) return; // 已结算/失败不处理
-
-    // 播报里的期号 = 游戏方确认的注单归属期；补全缺失的 round_period
-    const period = parseWindowPeriod(text);
-    if (period && !fresh.round_period) {
-      actionLogDao.updateRoundPeriodIfEmpty(fresh.id, period);
-    }
-
-    const state = ruleStateDao.ensure(fresh.rule_id, chatId);
-    if (!state.pending_direction) return;
-
-    const dice = this._findDiceForBet(
-      chatId, beijingTimeToMs(fresh.created_at), period || fresh.round_period
-    );
-    if (!dice) return;
-
-    const rule = ruleDao.getById(fresh.rule_id);
-    if (!rule) return;
-
-    const blockedChats = [];
-    let settledCount = 0;
-    transaction(() => {
-      const isWin = this._judgeWin(fresh.direction, dice.value);
-      const profit = isWin ? this._winProfit(chatId, fresh.bet_amount) : -fresh.bet_amount;
-      settledCount = this._applySettlement(
-        botUserId, rule, chatId, fresh, dice.value, isWin, profit,
-        state, blockedChats, '发送确认补结算'
-      );
-    });
-
-    await this._afterSettlement(botUserId, {
-      settledCount, armedRules: [], resumedChats: [], blockedChats,
-    });
-  }
-
-  /**
-   * 写入结算结果 + 连败更新 + 停注硬约束（骰子/结算消息/兜底三条路径共用）
-   * 需在事务内调用
-   *
-   * @param {object} pending - action_logs 行（未结算的实发注）
-   * @param {number} diceValue - 用于判定的开奖点数
-   * @param {0|1} isWin
-   * @param {number} profit
-   * @param {object} state - rule_chat_state 行（调用方读取，含连败数）
-   * @param {Array} blockedChats - 停注群收集器
-   * @param {string} source - 结算来源（日志用）：'骰子'|'结算消息'|'开盘兜底'|'发送确认补结算'
-   * @returns {number} 实际结算的行数（0=已被并发结算）
-   */
-  _applySettlement(botUserId, rule, chatId, pending, diceValue, isWin, profit, state, blockedChats, source) {
-    const changed = actionLogDao.markSettled(pending.id, isWin, profit);
-    if (!changed) return 0;
-
-    const newLosses = isWin ? 0 : state.consecutive_losses + 1;
-    ruleStateDao.updateState(rule.id, chatId, {
-      consecutiveLosses: newLosses,
-      pendingDirection: null,
-    });
-
-    logger.info(
-      `[STRATEGY_EXEC] 结算: 规则=${rule.id}, 群=${maskChatId(chatId)}, 方向=${pending.direction}, ` +
-      `点数=${diceValue}, ${isWin ? '赢' : '输'} 盈亏=${profit != null ? profit : '-'}, ` +
-      `连败=${newLosses}` +
-      `${source === '骰子' ? `（赔率×${this._oddsFor(chatId)}）` : `（${source}）`}`
-    );
-    operationLogDao.insert({
-      bot_user_id: botUserId,
-      action: 'BET_SETTLED',
-      detail: `规则「${rule.name || rule.id}」@${maskChatId(chatId)} ` +
-        `${isWin ? '赢' : '输'}${profit != null ? ` ${profit}` : ''}，连败 ${newLosses}`,
-    });
-
-    // 止损硬约束：连败上限
-    // 只停「这个群」—— 规则本身继续在别的群运行，
-    // 本群等连击中断后下一次触发自动恢复（连败清零）
-    if (newLosses >= rule.max_lose_streak) {
-      blockedChats.push({
-        rule, chatId,
-        reason: `连续未中 ${newLosses} 次，已达连败上限 ${rule.max_lose_streak}`,
-      });
-      ruleStateDao.blockChat(rule.id, chatId,
-        `连续未中 ${newLosses} 次，已达连败上限 ${rule.max_lose_streak}`);
-      return 1;
-    }
-    // 止损硬约束：累计投入（只算「已经真实投出去的钱」，不再多算下一注）
-    if (rule.stop_loss != null) {
-      const spent = calcCumulativeStake(
-        rule.base_bet, rule.martingale_ratio, Math.max(0, newLosses - 1)
-      );
-      if (spent >= rule.stop_loss) {
-        const reason = `累计投入 ${spent} 已达止损上限 ${rule.stop_loss}`;
-        ruleStateDao.blockChat(rule.id, chatId, reason);
-        blockedChats.push({ rule, chatId, reason });
-        return 1;
-      }
-    }
-    return 1;
+    return settledCount;
   }
 
   /**
