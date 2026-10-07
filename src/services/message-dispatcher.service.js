@@ -3,11 +3,13 @@ const monitoredChatDao = require('../db/monitored-chat.dao');
 const messageLogDao = require('../db/message-log.dao');
 const actionLogDao = require('../db/action-log.dao');
 const accountDao = require('../db/account.dao');
+const chatOddsDao = require('../db/chat-odds.dao');
 const logger = require('../utils/logger');
 const { maskChatId } = require('../utils/mask.util');
 const {
   parseDiceMessage, isSettleMessage, parseBalance, parseBetResult,
   isBalanceQueryReply, parseBalanceQuery, getReplyToMsgId, isBalanceForNickname,
+  parseOddsSamples,
 } = require('../core/dice.parser');
 const { isBetWindowMessage } = require('./strategy-executor.service');
 const { get: getConfigValue } = require('../utils/config.loader');
@@ -23,7 +25,8 @@ const { get: getConfigValue } = require('../utils/config.loader');
  *     监听与轮询双通道重复投递会导致：同一注被旧结算提前结算、
  *     重复待发后同一期下两注（重复下注）、发送在途时挂起被自愈误清（漏结算）。
  *   - 按群分发：分发给全部「在线且开启监听」的监听账号，
- *     各账号的规则 / 挂起状态 / 结算名单匹配彼此独立，互不影响。
+ *     各账号的规则 / 挂起状态 / 输赢判定彼此独立，互不影响。
+ *   - 赔率学习：结算名单是群级数据，每条结算消息只学习一次（chat_odds）
  *
  * 接口：
  *   dispatch(message, chatId)
@@ -126,6 +129,15 @@ class MessageDispatcherService {
     }
 
     if (kind === 'settle') {
+      // 赔率学习是群级数据：每条结算消息只学一次，与监听账号数无关
+      const samples = parseOddsSamples(message.message);
+      if (samples.length > 0) {
+        try {
+          chatOddsDao.recordSamples(chatId, samples);
+        } catch (err) {
+          logger.warn(`[DISPATCH] 赔率样本写入失败: 群=${maskChatId(chatId)}, ${err.message}`);
+        }
+      }
       for (const userId of targets) {
         await this.strategyExecutor.handleSettleMessage(userId, chatId, message.message)
           .catch((err) => logger.error(`[DISPATCH] handleSettleMessage 异常: 用户=${userId}, ${err.message}`));
@@ -176,7 +188,7 @@ class MessageDispatcherService {
       );
 
       // 同一条回复同时表明投注成败：
-      //   ✅ 投注成功 → 正常，保留挂起等结算
+      //   ✅ 投注成功 → 正常，保留挂起等开奖点数结算
       //   ❌ 余额不足等 → 这笔根本没投出去，必须立刻作废，
       //      否则会一直挂起等结算，把「规则 × 群」卡死
       const result = parseBetResult(message.message);
@@ -185,6 +197,13 @@ class MessageDispatcherService {
           balanceOwner, chatId, bet, result.reason
         ).catch((err) => logger.error(
           `[DISPATCH] handleBetRejected 异常: 用户=${balanceOwner}, ${err.message}`
+        ));
+      } else if (result.success && bet) {
+        // 确认成功：回填期号；若该期骰子已先到（发送在途错过开奖），立即补结算
+        await this.strategyExecutor.handleBetConfirmed(
+          balanceOwner, chatId, bet, message.message
+        ).catch((err) => logger.error(
+          `[DISPATCH] handleBetConfirmed 异常: 用户=${balanceOwner}, ${err.message}`
         ));
       }
 
@@ -196,7 +215,7 @@ class MessageDispatcherService {
     }
 
     for (const userId of targets) {
-      await this.strategyExecutor.handleRoundOpen(userId, chatId)
+      await this.strategyExecutor.handleRoundOpen(userId, chatId, message.message)
         .catch((err) => logger.error(`[DISPATCH] handleRoundOpen 异常: 用户=${userId}, ${err.message}`));
     }
   }
