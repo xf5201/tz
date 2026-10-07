@@ -440,17 +440,17 @@ class StrategyExecutorService {
           }
         } else {
           // ── 模拟注：按开奖点数判定输赢（不产生盈亏金额；期号不一致则跳过） ──
+          // 复用 _applySettlement 与实发完全同口径：连败计数、连败上限停注、
+          // 止损停注全部生效。只 markSettled 不更新连败的话，模拟倍投链
+          // 永远停在基础注，验证不了真实下注时的资金推演。
           const dry = actionLogDao.getLatestUnsettledDry(rule.id, chatId);
           if (dry && settle.diceValue != null
             && (!dry.round_period || !settle.period || dry.round_period === settle.period)) {
             const isWin = this._judgeWin(dry.direction, settle.diceValue);
-            if (actionLogDao.markSettled(dry.id, isWin, null)) {
-              settledCount++;
-              logger.info(
-                `[STRATEGY_EXEC] 模拟结算: 规则=${rule.id}, 方向=${dry.direction}, ` +
-                `点数=${settle.diceValue}, ${isWin ? '赢' : '输'}`
-              );
-            }
+            settledCount += this._applySettlement(
+              botUserId, rule, chatId, dry, settle.diceValue, isWin, null,
+              state, blockedChats, '模拟结算'
+            );
           }
         }
 

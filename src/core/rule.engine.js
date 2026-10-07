@@ -144,12 +144,15 @@ function balanceFloor() {
  * 用途：余额连最便宜的一注都买不起时，没必要再发指令去撞
  * 「❌ 余额不足」的墙，直接停注更干净。
  *
+ * 只统计实发规则（dry_run=1 为模拟）：模拟规则不发消息、不消耗真实余额，
+ * 把它们算进「买不买得起」会让模拟模式被真实余额误伤卡停。
+ *
  * @param {Array} rules
  * @returns {number}
  */
 function minBaseBet(rules) {
   const bases = (rules || [])
-    .filter((r) => r.enabled === 1)
+    .filter((r) => r.enabled === 1 && r.dry_run !== 1)
     .map((r) => Number(r.base_bet))
     .filter((n) => Number.isFinite(n) && n > 0);
   return bases.length ? Math.min(...bases) : 0;
@@ -164,15 +167,21 @@ function minBaseBet(rules) {
  * 从未解析到余额（null）时一律返回 false —— 消息格式一变就让整套规则
  * 静默罢工是最危险的行为，宁可照常下注后被机器人拒绝。
  *
+ * 只对实发规则生效：模拟规则不投真实资金，纯模拟用户
+ * （没有启用中的实发规则）永远不做余额停注，否则模拟模式
+ * 会被一份可能过期的真实余额永久卡住。
+ *
  * @param {number|null|undefined} balance
  * @param {Array} rules - 启用中的规则（用于取最小单注）
  * @returns {boolean}
  */
 function isBalanceInsufficient(balance, rules) {
+  const liveRules = (rules || []).filter((r) => r.enabled === 1 && r.dry_run !== 1);
+  if (liveRules.length === 0) return false;
   if (balance == null || !Number.isFinite(Number(balance))) return false;
   const b = Number(balance);
   if (b <= balanceFloor()) return true;
-  const minBet = minBaseBet(rules);
+  const minBet = minBaseBet(liveRules);
   return minBet > 0 && b < minBet;
 }
 
