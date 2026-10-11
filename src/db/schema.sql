@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- 是否因达到止盈而停止：1 = 停（需用户手动恢复）
     profit_stopped INTEGER NOT NULL DEFAULT 0 CHECK(profit_stopped IN (0,1)),
     profit_stopped_at DATETIME NULL,
+    -- 模拟模式（账号级）：1 = 全局只模拟不下真注（倍投/连败/止损/止盈照常推演）
+    simulate       INTEGER NOT NULL DEFAULT 0 CHECK(simulate IN (0,1)),
+    -- 模拟钱包余额（手动设置；模拟下注扣减、结算返还）
+    sim_balance    REAL NULL,
+    -- 模拟钱包初始额（展示盈亏幅度 / 一键重置）
+    sim_initial_balance REAL NULL,
     created_at     DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     updated_at     DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     FOREIGN KEY (bot_user_id) REFERENCES bot_users(bot_user_id)

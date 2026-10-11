@@ -46,6 +46,15 @@ class DashboardHandler {
         await this.handleResumeProfit(ctx, botUserId, { panelRenderer, services });
         break;
 
+      case 'simulate_toggle':
+        await this.handleSimulateToggle(ctx, botUserId, { panelRenderer, services });
+        break;
+
+      case 'sim_amount':
+        // 进入自定义输入：设置模拟钱包金额
+        await ctx.scene.enter('input', { field: 'sim_amount' });
+        break;
+
       case 'query_balance':
         await this.handleQueryBalance(ctx, botUserId, { panelRenderer, services });
         break;
@@ -189,6 +198,41 @@ class DashboardHandler {
     }
 
     await services.strategyExecutor.resumeFromTakeProfit(botUserId);
+    await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+  }
+
+  /**
+   * 模拟模式开关（账号级）
+   *
+   * 开启后所有规则只推演不下真注：倍投 / 连败计数 / 连败上限停注 / 止损 /
+   * 止盈 / 盈亏统计全部照常执行，只是不往群里发指令、不动真实余额。
+   * 切换模式时清空各群待发 / 挂起标记，避免跨模式残留状态错配。
+   */
+  static async handleSimulateToggle(ctx, botUserId, { panelRenderer, services }) {
+    const account = accountDao.getActive(botUserId);
+    if (!account) {
+      await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
+      return;
+    }
+
+    const on = account.simulate === 1 ? 0 : 1;
+    accountDao.setSimulate(botUserId, on);
+
+    // 模式切换：清掉待发 / 挂起，防止「模拟挂起注」被真实结算（或反之）
+    let cleared = 0;
+    if (services && services.strategyExecutor) {
+      cleared = services.strategyExecutor.clearLiveFlagsByUser(botUserId);
+    }
+
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: on ? 'ENABLE_SIMULATE' : 'DISABLE_SIMULATE',
+      detail: on
+        ? `开启模拟模式（模拟钱包 ${account.sim_balance ?? 1000}，已清理 ${cleared} 个群待发/挂起标记）`
+        : `关闭模拟模式，恢复实发（已清理 ${cleared} 个群待发/挂起标记）`,
+    });
+    logger.info(`[DASHBOARD] 用户 ${botUserId} 模拟模式 = ${on ? '开' : '关'}`);
+
     await panelRenderer.render(ctx, 'dashboard', this.collectData(botUserId));
   }
 

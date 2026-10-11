@@ -105,6 +105,8 @@ class StrategyExecutorService {
    * @param {object} deps.notification
    */
   constructor(deps) {
+    // botUserId → 是否模拟模式（账号级，本次处理周期内缓存）
+    this._simCache = new Map();
     this.betSender = deps.betSender;
     this.notification = deps.notification;
 
@@ -128,6 +130,7 @@ class StrategyExecutorService {
   async handleOpen(botUserId, chatId, dice) {
     const account = accountDao.getActive(botUserId);
     if (!account || account.status !== 'ACTIVE') return;
+    this._simOf(botUserId, account);
 
     const rules = ruleDao.listEnabledByUser(botUserId);
     if (rules.length === 0) return;
@@ -217,6 +220,7 @@ class StrategyExecutorService {
   async handleRoundOpen(botUserId, chatId, text) {
     const account = accountDao.getActive(botUserId);
     if (!account || account.status !== 'ACTIVE') return;
+    this._simOf(botUserId, account);
 
     // 今日已达标止盈 → 不再下注，等用户手动恢复
     if (account.profit_stopped === 1) return;
@@ -277,7 +281,7 @@ class StrategyExecutorService {
         const direction = state.armed_direction;
         const amount = calcAmount(rule.base_bet, rule.martingale_ratio, state.consecutive_losses);
         const actionText = buildBetText(direction, amount);
-        const isDry = rule.dry_run === 1;
+        const isDry = this._simOf(botUserId);
 
         const actionId = actionLogDao.insert({
           bot_user_id: botUserId,
@@ -296,7 +300,8 @@ class StrategyExecutorService {
         // 发送失败时再在下方回滚 pending（本轮放弃），不会卡死。
         ruleStateDao.updateState(rule.id, chatId, {
           armedDirection: null,
-          pendingDirection: isDry ? null : direction,
+          // 模拟注同样占位：否则下一条开奖骰子找不到可结算对象（模拟会漏结算）
+          pendingDirection: direction,
         });
 
         candidates.push({ rule, direction, amount, actionId, actionText, isDry });
@@ -307,6 +312,8 @@ class StrategyExecutorService {
     for (const c of candidates) {
       if (c.isDry) {
         // 模拟：占位时未置 pending，这里无需回滚，连败数不变
+        // 模拟钱包扣减本金（结算时按盈亏返还）——与实发同口径推演资金曲线
+        accountDao.deductSimBalance(botUserId, c.amount);
         operationLogDao.insert({
           bot_user_id: botUserId,
           action: 'BET_CREATED',
@@ -383,6 +390,7 @@ class StrategyExecutorService {
    */
   async handleSettleMessage(botUserId, chatId, text) {
     const account = accountDao.getActive(botUserId);
+    if (account) this._simOf(botUserId, account);
     if (!account || account.status !== 'ACTIVE') return;
 
     const rules = ruleDao.listEnabledByUser(botUserId);
@@ -398,8 +406,20 @@ class StrategyExecutorService {
       for (const rule of rules) {
         let state = ruleStateDao.ensure(rule.id, chatId);
 
+        // ── 模拟模式：结算名单到达时直接判模拟注（模拟挂起的也是 DRY_RUN 单）──
+        if (this._simOf(botUserId)) {
+          const dry = actionLogDao.getLatestUnsettledDry(rule.id, chatId);
+          if (dry && settle.diceValue != null
+            && (!dry.round_period || !settle.period || dry.round_period === settle.period)) {
+            const isWin = this._judgeWin(dry.direction, settle.diceValue);
+            const dryProfit = isWin ? this._winProfit(chatId, dry.bet_amount) : -dry.bet_amount;
+            settledCount += this._applySettlement(
+              botUserId, rule, chatId, dry, settle.diceValue, isWin, dryProfit,
+              state, blockedChats, '模拟结算'
+            );
+          }
+        } else if (state.pending_direction) {
         // ── 实发注兜底结算：骰子消息被错过时，用同期结算消息里的点数判定 ──
-        if (state.pending_direction) {
           const pending = actionLogDao.getLatestUnsettledSent(rule.id, chatId);
 
           if (!pending) {
@@ -447,8 +467,10 @@ class StrategyExecutorService {
           if (dry && settle.diceValue != null
             && (!dry.round_period || !settle.period || dry.round_period === settle.period)) {
             const isWin = this._judgeWin(dry.direction, settle.diceValue);
+            // 与实发同口径：赢按群赔率算净盈利，输 = 本金
+            const dryProfit = isWin ? this._winProfit(chatId, dry.bet_amount) : -dry.bet_amount;
             settledCount += this._applySettlement(
-              botUserId, rule, chatId, dry, settle.diceValue, isWin, null,
+              botUserId, rule, chatId, dry, settle.diceValue, isWin, dryProfit,
               state, blockedChats, '模拟结算'
             );
           }
@@ -625,6 +647,20 @@ class StrategyExecutorService {
    * @returns {number} 结算的注单数（0 或 1）
    */
   _settlePendingWithDice(botUserId, rule, chatId, dice, state, blockedChats) {
+    // 模拟模式：挂起的是 DRY_RUN 注单，用本次开奖点数直接结算
+    if (this._simOf(botUserId)) {
+      const dry = actionLogDao.getLatestUnsettledDry(rule.id, chatId);
+      if (dry && dice.value != null) {
+        const isWin = this._judgeWin(dry.direction, dice.value);
+        const profit = isWin ? this._winProfit(chatId, dry.bet_amount) : -dry.bet_amount;
+        return this._applySettlement(
+          botUserId, rule, chatId, dry, dice.value, isWin, profit,
+          state, blockedChats, '模拟骰子'
+        );
+      }
+      return 0;
+    }
+
     const pending = actionLogDao.getLatestUnsettledSent(rule.id, chatId);
 
     if (!pending) {
@@ -686,6 +722,24 @@ class StrategyExecutorService {
    * @returns {number} 结算的注单数（0 或 1）
    */
   _sweepPendingAtRoundOpen(botUserId, rule, chatId, blockedChats) {
+    // 模拟模式：用内存里已捕获的骰子判定上期模拟挂起注
+    if (this._simOf(botUserId)) {
+      const dry = actionLogDao.getLatestUnsettledDry(rule.id, chatId);
+      if (dry) {
+        const dice = this._findDiceForBet(chatId, beijingTimeToMs(dry.created_at));
+        if (dice) {
+          const isWin = this._judgeWin(dry.direction, dice.value);
+          const profit = isWin ? this._winProfit(chatId, dry.bet_amount) : -dry.bet_amount;
+          return this._applySettlement(
+            botUserId, rule, chatId, dry, dice.value, isWin, profit,
+            ruleStateDao.ensure(rule.id, chatId), blockedChats, '模拟兜底'
+          );
+        }
+        return 0;
+      }
+      return 0;
+    }
+
     const pending = actionLogDao.getLatestUnsettledSent(rule.id, chatId);
     if (!pending) {
       // 自愈：无在途发送才清（与开奖路径同一规则）
@@ -784,6 +838,11 @@ class StrategyExecutorService {
   _applySettlement(botUserId, rule, chatId, pending, diceValue, isWin, profit, state, blockedChats, source) {
     const changed = actionLogDao.markSettled(pending.id, isWin, profit);
     if (!changed) return 0;
+
+    // 模拟模式：结算入账（赢 = 本金 + 盈利；输 = 本金已在下注时扣除，此处返还 0）
+    if (this._simOf(botUserId) && profit != null) {
+      accountDao.creditSimBalance(botUserId, Number(pending.bet_amount) + Number(profit));
+    }
 
     const newLosses = isWin ? 0 : state.consecutive_losses + 1;
     ruleStateDao.updateState(rule.id, chatId, {
@@ -1001,9 +1060,29 @@ class StrategyExecutorService {
    * @param {Array} rules - 启用中的规则
    * @returns {boolean}
    */
+  /**
+   * 该用户当前是否为模拟模式（账号级）
+   * 账号对象已知时直接判断；否则查库并缓存
+   */
+  _simOf(botUserId, account = null) {
+    const key = String(botUserId);
+    if (account) {
+      const v = account.simulate === 1;
+      this._simCache.set(key, v);
+      return v;
+    }
+    if (this._simCache.has(key)) return this._simCache.get(key);
+    const acc = accountDao.getActive(key);
+    const v = !!acc && acc.simulate === 1;
+    this._simCache.set(key, v);
+    return v;
+  }
+
   isBalanceDepleted(account, rules = []) {
     if (!account) return false;
-    return isBalanceInsufficient(account.balance, rules);
+    // 模拟模式下用模拟钱包判定（不下真注，自然也不该被真实余额卡停）
+    const balance = account.simulate === 1 ? account.sim_balance : account.balance;
+    return isBalanceInsufficient(balance, rules);
   }
 
   /**
@@ -1239,6 +1318,14 @@ class StrategyExecutorService {
    * @param {string} botUserId
    * @returns {Promise<number>} 重置后的本轮盈利（应为 0）
    */
+  /**
+   * 清空该用户全部待发 / 挂起标记（切换模拟模式、清空记录后调用）
+   * @returns {number} 清理的状态行数
+   */
+  clearLiveFlagsByUser(botUserId) {
+    return actionLogDao.clearLiveFlagsByUser(botUserId);
+  }
+
   async resumeFromTakeProfit(botUserId) {
     const todayProfit = this.getTodayProfit(botUserId);
     accountDao.resumeFromProfitStop(botUserId, todayProfit);

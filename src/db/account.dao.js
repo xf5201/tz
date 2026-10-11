@@ -136,6 +136,68 @@ const accountDao = {
    * @param {string} botUserId
    * @param {0|1} enabled
    */
+  /**
+   * 模拟模式开关（账号级）
+   * 开启时若尚未设置模拟钱包，自动以默认额度初始化
+   * @param {string} botUserId
+   * @param {0|1} on
+   * @param {number} defaultBalance - 首次开启时的默认模拟金额
+   */
+  setSimulate(botUserId, on, defaultBalance = 1000) {
+    const db = getConnection();
+    if (on) {
+      db.prepare(`
+        UPDATE accounts
+        SET simulate = 1,
+            sim_balance = CASE WHEN sim_balance IS NULL THEN ? ELSE sim_balance END,
+            sim_initial_balance = CASE WHEN sim_initial_balance IS NULL THEN ? ELSE sim_initial_balance END,
+            updated_at = datetime('now', '+8 hours')
+        WHERE bot_user_id = ?
+      `).run(Number(defaultBalance), Number(defaultBalance), String(botUserId));
+      return;
+    }
+    db.prepare(`
+      UPDATE accounts SET simulate = 0, updated_at = datetime('now', '+8 hours')
+      WHERE bot_user_id = ?
+    `).run(String(botUserId));
+  },
+
+  /**
+   * 设置模拟钱包金额（同时作为新的初始额）
+   */
+  setSimBalance(botUserId, amount) {
+    const db = getConnection();
+    db.prepare(`
+      UPDATE accounts
+      SET sim_balance = ?, sim_initial_balance = ?, updated_at = datetime('now', '+8 hours')
+      WHERE bot_user_id = ?
+    `).run(Number(amount), Number(amount), String(botUserId));
+  },
+
+  /**
+   * 模拟钱包扣减（下注时）；余额不足也会被扣成负数，由上层停注逻辑拦截
+   */
+  deductSimBalance(botUserId, amount) {
+    const db = getConnection();
+    db.prepare(`
+      UPDATE accounts
+      SET sim_balance = COALESCE(sim_balance, 0) - ?, updated_at = datetime('now', '+8 hours')
+      WHERE bot_user_id = ?
+    `).run(Number(amount), String(botUserId));
+  },
+
+  /**
+   * 模拟钱包入账（结算时返还本金 + 盈亏）
+   */
+  creditSimBalance(botUserId, amount) {
+    const db = getConnection();
+    db.prepare(`
+      UPDATE accounts
+      SET sim_balance = COALESCE(sim_balance, 0) + ?, updated_at = datetime('now', '+8 hours')
+      WHERE bot_user_id = ?
+    `).run(Number(amount), String(botUserId));
+  },
+
   setAlertEnabled(botUserId, enabled) {
     const db = getConnection();
     db.prepare(`

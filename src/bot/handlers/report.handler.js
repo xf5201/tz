@@ -12,6 +12,8 @@ const logger = require('../../utils/logger');
  *   report:page:{n}          → 翻页
  *   report:clear_today       → 清空今日记录确认
  *   report:clear_today_do    → 执行清空今日记录（今日盈利随之归零）
+ *   report:clear_all         → 删除全部记录确认
+ *   report:clear_all_do      → 执行删除全部记录（不限日期）
  *   report:noop
  */
 const PAGE_SIZE = 10;
@@ -35,6 +37,14 @@ class ReportHandler {
 
       case 'clear_today_do':
         await this.handleClearToday(ctx, botUserId, { panelRenderer, services });
+        break;
+
+      case 'clear_all':
+        await this.renderClearAllConfirm(ctx, botUserId, { panelRenderer, services });
+        break;
+
+      case 'clear_all_do':
+        await this.handleClearAll(ctx, botUserId, { panelRenderer, services });
         break;
 
       case 'noop':
@@ -120,6 +130,47 @@ class ReportHandler {
       detail: `清空今日下注记录 ${removed} 条（同时清理 ${cleared} 个群的待发/挂起标记）`,
     });
     logger.info(`[REPORT] 用户 ${botUserId} 清空今日记录 ${removed} 条`);
+
+    await panelRenderer.render(ctx, 'report', this.collectData(botUserId, 0, services));
+  }
+
+  /**
+   * 删除全部记录确认框
+   */
+  static async renderClearAllConfirm(ctx, botUserId, { panelRenderer, services }) {
+    const total = actionLogDao.countByUser(botUserId);
+
+    if (total === 0) {
+      await panelRenderer.render(ctx, 'report', this.collectData(botUserId, 0, services));
+      return;
+    }
+
+    await panelRenderer.render(ctx, 'confirm', {
+      title: '删除全部下注记录',
+      message:
+        `将删除本账号全部 <b>${total}</b> 条下注记录（不限日期）。\n` +
+        '今日盈利统计随之归零，各群连败计数保留。\n' +
+        '⚠️ 删除后不可恢复，且当前挂起 / 待发标记会一并清空。',
+      confirmCallback: 'report:clear_all_do',
+      cancelCallback: 'report:main',
+    });
+  }
+
+  /**
+   * 执行删除全部记录
+   */
+  static async handleClearAll(ctx, botUserId, { panelRenderer, services }) {
+    const total = actionLogDao.countByUser(botUserId);
+    actionLogDao.deleteByUser(botUserId);
+    // 记录已删，挂起 / 待发标记一起清，否则执行器会反复自愈告警
+    const cleared = actionLogDao.clearLiveFlagsByUser(botUserId);
+
+    operationLogDao.insert({
+      bot_user_id: botUserId,
+      action: 'CLEAR_ALL_BETS',
+      detail: `删除全部下注记录 ${total} 条（同时清理 ${cleared} 个群的待发/挂起标记）`,
+    });
+    logger.info(`[REPORT] 用户 ${botUserId} 删除全部记录 ${total} 条`);
 
     await panelRenderer.render(ctx, 'report', this.collectData(botUserId, 0, services));
   }

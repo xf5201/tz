@@ -193,7 +193,7 @@ class AccountService {
 
     const sessionString = client.session.save();
 
-    try { await client.disconnect(); } catch (_) {}
+    // 仅从临时表摘除，不断开连接（连接将被收编复用）
     this._tempClients.delete(botUserId);
 
     transaction(() => {
@@ -215,9 +215,20 @@ class AccountService {
       });
     });
 
-    await this.sessionManager.initClient(botUserId, sessionString, {
-      onConnected: this.hooks.onConnected,
-    });
+    try {
+      // 首选：复用登录连接，零重建（规避 msg_id 回退）
+      await this.sessionManager.adoptClient(botUserId, client, {
+        onConnected: this.hooks.onConnected,
+      });
+    } catch (error) {
+      // 兜底：确认断开后等待一个完整秒级周期，保证新连接 msg_id 严格递增
+      logger.warn(`[ACCOUNT] 用户 ${botUserId} 收编失败，回退重建连接: ${error.message}`);
+      try { await client.disconnect(); } catch (_) {}
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await this.sessionManager.initClient(botUserId, sessionString, {
+        onConnected: this.hooks.onConnected,
+      });
+    }
     logger.info(`[ACCOUNT] 用户 ${botUserId} 登录完成: ${maskPhone(phone)}`);
     return { need2FA: false, phone };
   }

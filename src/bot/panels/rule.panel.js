@@ -50,11 +50,9 @@ class RulePanel {
 
     for (const rule of rules) {
       const state = rule.enabled ? '🟢' : '⚪';
-      const dry = rule.dry_run ? '🧪' : '';
-      text += `${state}${dry} <b>${truncate(rule.name || `规则${rule.id}`, 18)}</b>\n`;
+      text += `${state} <b>${truncate(rule.name || `规则${rule.id}`, 18)}</b>\n`;
       text += `   ${describeRule(rule)}\n`;
       text += `   基础 ${rule.base_bet} × ${rule.martingale_ratio}｜连败上限 ${rule.max_lose_streak}｜${rule.stop_loss != null ? `止损 ${rule.stop_loss}` : '不限止损'}\n`;
-      text += `   模式：${rule.dry_run ? '🧪 模拟（只记录）' : '📤 实发'}\n`;
       const states = stateByRule[rule.id] || [];
       if (states.length > 0) {
         const losses = states.map((s) => s.consecutive_losses);
@@ -66,7 +64,7 @@ class RulePanel {
       }
       text += '\n';
       buttons.push([Markup.button.callback(
-        `${state}${dry} 连${rule.streak_count}把反买｜基础${rule.base_bet}｜${rule.martingale_ratio}x`,
+        `${state} 连${rule.streak_count}把反买｜基础${rule.base_bet}｜${rule.martingale_ratio}x`,
         `rule:edit:${rule.id}`
       )]);
     }
@@ -96,7 +94,6 @@ class RulePanel {
     text += `🛑 连败上限：${draft.max_lose_streak ?? '⬜'}\n`;
     text += `⚖️ 止损上限：${draft.stop_loss != null ? draft.stop_loss : '不限'}\n`;
     text += `⏱ 最小间隔：${draft.min_interval ?? 3}s\n`;
-    text += `🧪 模式：${draft.dry_run ? '模拟（只记录不发送）' : '📤 实发'}\n`;
     text += '━━━━━━━━━━━━━━━━━━━━\n';
 
     const buttons = [
@@ -108,10 +105,6 @@ class RulePanel {
         Markup.button.callback(`⚖️ 止损：${draft.stop_loss != null ? draft.stop_loss : '不限'}`, 'rule:w_stop'),
         Markup.button.callback(`⏱ 间隔：${draft.min_interval ?? 3}s`, 'rule:w_minint'),
       ],
-      [Markup.button.callback(
-        draft.dry_run ? '🧪 模拟模式：开（点击切换为实发）' : '📤 实发模式：开（点击切换为模拟）',
-        'rule:w_dry'
-      )],
     ];
 
     if (isEdit) {

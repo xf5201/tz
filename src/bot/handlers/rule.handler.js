@@ -16,7 +16,7 @@ const logger = require('../../utils/logger');
  *   rule:w_base[:{v}|custom] / rule:w_ratio[:{v}|custom]
  *   rule:w_maxlose[:{n}|custom] / rule:w_stop[:{v}|custom|none] / rule:w_minint[:{v}]
  *   rule:w_back / rule:w_confirm / rule:w_cancel
- *   rule:toggle:{id} / rule:w_dry（模拟切换）/ rule:del:{id} / rule:del_do:{id}
+ *   rule:toggle:{id} / rule:del:{id} / rule:del_do:{id}
  */
 class RuleHandler {
   static async handle(ctx, action, params, { panelRenderer, services }) {
@@ -87,10 +87,6 @@ class RuleHandler {
         await this.handleNumeric(ctx, botUserId, params, 'minint', { panelRenderer });
         break;
 
-      case 'w_dry':
-        await this.withDraft(ctx, botUserId, (draft) => { draft.dry_run = draft.dry_run ? 0 : 1; }, { panelRenderer });
-        break;
-
       // ── 向导导航 ──
       case 'w_back':
         await this.renderSub(ctx, botUserId, 'wizard', { panelRenderer });
@@ -145,8 +141,8 @@ class RuleHandler {
   }
 
   static async handleNew(ctx, botUserId, { panelRenderer }) {
-    // 新规则默认开启模拟模式（只记录不发送），确认策略有效后再手动切换实发
-    const draft = { dry_run: 1 };
+    // 模拟 / 实发已改为账号级开关（主面板切换），规则层不再单独控制
+    const draft = {};
     ctx.services.panelContextDao.updateWizardState(botUserId, JSON.stringify({
       scene: 'rule_wizard', draft,
     }));
@@ -165,7 +161,6 @@ class RuleHandler {
       max_lose_streak: rule.max_lose_streak,
       stop_loss: rule.stop_loss,
       min_interval: rule.min_interval,
-      dry_run: rule.dry_run === 1,
       enabled: rule.enabled === 1,
     };
 
@@ -294,7 +289,7 @@ class RuleHandler {
       max_lose_streak: draft.max_lose_streak ?? 6,
       stop_loss: draft.stop_loss ?? null,
       min_interval: draft.min_interval ?? 3,
-      dry_run: draft.dry_run ? 1 : 0,
+      dry_run: 0,
     };
 
     let ruleId;
@@ -311,7 +306,7 @@ class RuleHandler {
     operationLogDao.insert({
       bot_user_id: botUserId,
       action: draft.editId != null ? 'UPDATE_RULE' : 'CREATE_RULE',
-      detail: `${fields.name}｜基础${fields.base_bet}×${fields.martingale_ratio}｜连败上限${fields.max_lose_streak}${fields.stop_loss != null ? `｜止损${fields.stop_loss}` : ''}｜${fields.dry_run ? '🧪模拟' : '📤实发'}`,
+      detail: `${fields.name}｜基础${fields.base_bet}×${fields.martingale_ratio}｜连败上限${fields.max_lose_streak}${fields.stop_loss != null ? `｜止损${fields.stop_loss}` : ''}`,
     });
 
     ctx.services.panelContextDao.clearWizardState(botUserId);

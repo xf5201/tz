@@ -102,7 +102,7 @@ const FIELD_CONFIG = {
     prompt: '请输入同群两次下注的最小间隔秒数（0–3600，例如：0、3、5、10）',
     validate: (value) => {
       const num = parseInt(value, 10);
-      if (isNaN(num) || String(num) !== value.trim()) return '请输入有效的整数';
+      if (isNaN(num)) return '请输入有效的整数';
       if (num < 0 || num > 3600) return '间隔需为 0–3600 秒';
       return null;
     },
@@ -142,6 +142,33 @@ const FIELD_CONFIG = {
       logger.info(`[INPUT_SCENE] 用户 ${botUserId} 止盈目标 = ${value > 0 ? value : '不启用'}`);
     },
     format: (value) => (value == null || value === '未设置' ? '未设置' : `${value}`),
+    returnPanel: 'dashboard',
+  },
+
+  // ── 主面板：模拟钱包金额（账号级，直接写库）──
+  sim_amount: {
+    label: '模拟钱包金额',
+    prompt:
+      '请输入模拟钱包的金额（正数，例如：1000、5000、10000）\n' +
+      '💡 模拟模式下用它代替真实余额做倍投推演与停注判定',
+    validate: (value) => {
+      const num = parseFloat(value);
+      if (isNaN(num)) return '请输入有效的数字';
+      if (num <= 0) return '模拟金额必须大于 0';
+      if (num > 100000000) return '模拟金额过大';
+      return null;
+    },
+    parse: (value) => parseFloat(value),
+    directApply: (botUserId, value) => {
+      accountDao.setSimBalance(botUserId, value);
+      operationLogDao.insert({
+        bot_user_id: botUserId,
+        action: 'SET_SIM_BALANCE',
+        detail: `设置模拟钱包金额 ${value}`,
+      });
+      logger.info(`[INPUT_SCENE] 用户 ${botUserId} 模拟钱包 = ${value}`);
+    },
+    format: (value) => (value == null ? '未设置' : `${value}`),
     returnPanel: 'dashboard',
   },
 
@@ -380,10 +407,45 @@ function readDraft(botUserId) {
 }
 
 function cancelCallback(field) {
+  if (field === 'sim_amount') return 'dashboard:refresh';
   if (field === 'chat_keyword') return 'chat:main';
   if (field === 'take_profit') return 'dashboard:refresh';
   return 'rule:w_back';
 }
+
+// ── 按钮取消：退出输入场景后把点击转发给 Router ──
+// WizardScene 的步骤 handler 不过滤 update 类型，callback_query 也会被吞掉
+// （表现为点「取消」无反应、且下一条消息仍被当成输入）。
+// 这里由场景级中间件先退出场景，再手动转交 CallbackRouter，
+// 使 dashboard:refresh / rule:w_back / chat:main 真正生效——直接回对应面板。
+let sharedCallbackRouter = null;
+inputScene.setCallbackRouter = (router) => { sharedCallbackRouter = router; };
+
+inputScene.use(async (ctx, next) => {
+  if (!ctx.callbackQuery) return next();
+  if (!ctx.wizard || !ctx.wizard.state) return next();
+
+  // 关键：进入场景的那一次 update 本身就是按钮点击
+  // （chat:search / rule:w_base / dashboard:take_profit … 都是点按钮进来的）。
+  // 必须放行，否则场景刚 enter 就被这里 leave 掉，
+  // 表现为「点了按钮没反应 / 卡住」。
+  if (ctx.wizard.state.__entered !== true) {
+    ctx.wizard.state.__entered = true;
+    return next();
+  }
+
+  const data = ctx.callbackQuery.data;
+  await ctx.scene.leave();
+
+  if (sharedCallbackRouter) {
+    await sharedCallbackRouter.handle(ctx);   // 内部静默关闭转圈，无文字提示
+  } else {
+    try { await ctx.answerCbQuery(); } catch (_) { /* ignore */ }
+  }
+
+  logger.info(`[INPUT_SCENE] 用户 ${ctx.from?.id} 按钮取消输入 (${data})`);
+  return;
+});
 
 // 超时处理：2 分钟无操作自动退出
 inputScene.use(async (ctx, next) => {

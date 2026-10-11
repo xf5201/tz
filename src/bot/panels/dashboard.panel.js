@@ -34,6 +34,24 @@ class DashboardPanel {
     text += `🔊 监听：${account.listen_enabled ? '🟢 开启' : '⚪ 已暂停'}\n`;
     text += `👥 监听群：${chats ? chats.length : 0} 个\n`;
 
+    // ── 模拟模式（账号级）：开则全局只推演不下真注 ──
+    if (account.simulate === 1) {
+      text += '🧪 <b>模拟模式：开</b>（只推演，不真下注）\n';
+      const sim = Number(account.sim_balance ?? 0);
+      const simInit = Number(account.sim_initial_balance ?? 0);
+      if (simInit > 0) {
+        const diff = sim - simInit;
+        const pct = ((diff / simInit) * 100).toFixed(1);
+        const sign = diff > 0 ? '+' : '';
+        text += `💼 模拟钱包：<b>${formatNumber(sim)}</b>（${sign}${pct}%｜${sign}${formatNumber(diff)}）\n`;
+      } else {
+        text += `💼 模拟钱包：<b>${formatNumber(sim)}</b>\n`;
+      }
+      if (isBalanceInsufficient(account.sim_balance, rules)) {
+        text += '🛑 模拟余额不足，已停注（可重设模拟金额）\n';
+      }
+    }
+
     // 当前余额（机器人对本账号下注的回复消息解析得到）
     if (account.balance != null) {
       const updated = account.balance_updated_at
@@ -95,8 +113,7 @@ class DashboardPanel {
       const enabled = rules.filter((r) => r.enabled === 1);
       text += `📌 规则：${enabled.length}/${rules.length} 条启用\n`;
       for (const rule of enabled.slice(0, 5)) {
-        const mode = rule.dry_run ? '🧪模拟' : '📤实发';
-        text += `   ${mode}·连${rule.streak_count}把反买（基础 ${rule.base_bet} × ${rule.martingale_ratio}）\n`;
+        text += `   ·连${rule.streak_count}把反买（基础 ${rule.base_bet} × ${rule.martingale_ratio}）\n`;
       }
       if (enabled.length > 5) text += `   …等共 ${enabled.length} 条\n`;
     } else {
@@ -161,6 +178,20 @@ class DashboardPanel {
       // 初始化余额：往群里发「余额」问一次，查到的余额即记为初始余额
       // （同时用于：充值后刷新余额、亏损预警的基准）
       buttons.push([Markup.button.callback('🔍 初始化余额', 'dashboard:query_balance')]);
+
+      // 模拟模式（账号级开关，替代原「每规则一个模拟开关」）
+      buttons.push([Markup.button.callback(
+        account.simulate === 1
+          ? '🧪 模拟模式：开（点击切换为实发）'
+          : '📤 实发模式：开（点击切换为模拟）',
+        'dashboard:simulate_toggle'
+      )]);
+      if (account.simulate === 1) {
+        buttons.push([Markup.button.callback(
+          `💼 设置模拟金额（当前 ${account.sim_balance ?? 0}）`,
+          'dashboard:sim_amount'
+        )]);
+      }
 
       buttons.push([Markup.button.callback('🗑️ 删除账号', 'account:delete_confirm')]);
     }

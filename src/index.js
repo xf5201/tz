@@ -110,7 +110,9 @@ async function main() {
     apiHash: config.tgApiHash,
   });
 
-  const notificationService = new NotificationService({ bot, panelRenderer });
+  const notificationService = new NotificationService({
+    bot, panelRenderer, panelContextDao,
+  });
 
   const betSender = new BetSenderService({ sessionManager, notification: notificationService });
 
@@ -161,6 +163,9 @@ async function main() {
     panelContextDao,
   };
 
+  // notification 需要 strategyExecutor 组装下注记录面板的本轮盈利
+  notificationService.services = services;
+
   // ── 注入 services 到 ctx（供 handler / scene 使用） ──
   bot.use((ctx, next) => {
     ctx.services = services;
@@ -195,6 +200,7 @@ async function main() {
 
   // ── Callback Router ──
   const callbackRouter = new CallbackRouter(panelRenderer, services);
+  inputScene.setCallbackRouter(callbackRouter);
   bot.on('callback_query', (ctx) => callbackRouter.handle(ctx));
 
   // ── Commands ──

@@ -138,7 +138,7 @@ class PanelRenderer {
       );
       logger.debug(`[PANEL] 推送更新: 用户 ${botUserId} → ${panelName}`);
     } catch (err) {
-      const errDesc = err.description || '';
+      const errDesc = err.description || err.message || '';
       if (errDesc.includes('message is not modified')) return;
 
       if (errDesc.includes('message to edit not found')) {
@@ -156,6 +156,23 @@ class PanelRenderer {
           );
         } catch (sendErr) {
           logger.warn(`[PANEL] 重发面板失败: ${sendErr.message}`);
+        }
+        return;
+      }
+
+      // 429 限流：稍等重试一次，否则这次状态变化就丢了（面板看起来"没更新"）
+      const isFlood = /Too Many Requests|429|retry after/i.test(errDesc);
+      if (isFlood) {
+        const wait = Number((/retry after (\d+)/i.exec(errDesc) || [])[1] || 1) * 1000 + 300;
+        await new Promise((r) => setTimeout(r, Math.min(wait, 5000)));
+        try {
+          await this.bot.telegram.editMessageText(
+            panelCtx.chat_id, panelCtx.message_id, null, text,
+            { parse_mode: 'HTML', reply_markup }
+          );
+          logger.debug(`[PANEL] 限流重试成功: 用户 ${botUserId} → ${panelName}`);
+        } catch (retryErr) {
+          logger.warn(`[PANEL] 限流重试仍失败: ${retryErr.message}`);
         }
         return;
       }

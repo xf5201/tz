@@ -92,6 +92,10 @@ class ReportPanel {
         todayCount > 0 ? `🗑 清空今日记录（${todayCount} 条）` : '🗑 清空今日记录（无记录）',
         'report:clear_today'
       )],
+      [Markup.button.callback(
+        total > 0 ? `🗑 删除全部记录（${total} 条）` : '🗑 删除全部记录（无记录）',
+        'report:clear_all'
+      )],
       [Markup.button.callback('🔙 返回', 'dashboard:refresh')]
     );
     return Markup.inlineKeyboard(buttons);

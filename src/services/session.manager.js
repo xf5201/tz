@@ -25,11 +25,12 @@ function getProxyConfig() {
  * 职责：
  *   - 管理所有用户的 TelegramClient 实例（内存 Map，按 botUserId 隔离）
  *   - 启动时从 DB 加载所有活跃 Session（loadActiveSessions）
- *   - 提供 getClient / initClient / destroyClient
+ *   - 提供 getClient / initClient / adoptClient / destroyClient
  *
  * 接口：
  *   getClient(botUserId)
  *   initClient(botUserId, sessionString)
+ *   adoptClient(botUserId, client)
  *   destroyClient(botUserId)
  *   loadActiveSessions()
  *   getActiveCount() / destroyAll()
@@ -121,6 +122,51 @@ class SessionManager {
         await hooks.onFailed(userId, error);
       }
 
+      throw error;
+    }
+  }
+
+  /**
+   * 收编一个已在登录流程中完成鉴权的 Client（复用连接，不重建）
+   *
+   * 背景：登录时旧连接刚断开就立刻 new 一个新 Client，两条连接在同一秒内、
+   * 共用同一把 auth_key，而 msg_id = (unix秒 << 32) | 递增序号，新连接序号
+   * 从 0 重新起算，反而小于服务端已记录的值 → 服务端判定 msg_id 回退，
+   * 返回 500 MSGID_DECREASE_RETRY。直接复用登录成功的那条连接即可规避。
+   *
+   * @param {string} botUserId
+   * @param {TelegramClient} client - 已完成 auth.signIn / auth.checkPassword 的实例
+   * @param {object} hooks - { onConnected(botUserId, client) }
+   * @returns {TelegramClient}
+   */
+  async adoptClient(botUserId, client, hooks = {}) {
+    const userId = String(botUserId);
+
+    // 重新登录场景：先断开该用户旧连接（避免同账号互踢）
+    const old = this._clients.get(userId);
+    if (old && old !== client) {
+      try {
+        await old.disconnect();
+      } catch (_) { /* ignore */ }
+      this._clients.delete(userId);
+    }
+
+    try {
+      const me = await client.getMe();
+      if (!me) {
+        throw new Error('收编 Client 后无法获取用户信息');
+      }
+
+      this._clients.set(userId, client);
+      logger.info(`[SESSION] 用户 ${userId} Client 已收编（复用登录连接）`);
+
+      if (hooks.onConnected) {
+        await hooks.onConnected(userId, client);
+      }
+
+      return client;
+    } catch (error) {
+      logger.error(`[SESSION] 用户 ${userId} Client 收编失败: ${error.message}`);
       throw error;
     }
   }
