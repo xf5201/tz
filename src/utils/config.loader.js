@@ -18,6 +18,11 @@ const fs = require('fs');
  *   MESSAGE_RETENTION_DAYS - 消息流水保留天数（默认 90）
  *   ACTION_RETENTION_DAYS  - 动作记录保留天数（默认 180）
  *   DICE_POLL_INTERVAL_MS  - 开奖轮询间隔（默认 5000）
+ *   LOTTERY_POOL_ENABLED   - 开奖池广播模式开关（默认 true；false = 旧版逐账号轮询）
+ *   LOTTERY_CONCURRENCY    - 开奖池跨群拉取并发上限（默认 8）
+ *   LOTTERY_CATALOG_REFRESH_MS - 开奖池拓扑目录刷新周期（默认 30000）
+ *   LOTTERY_SHARD_COUNT    - 池分片总数，按群哈希分片（默认 1 = 单池全量）
+ *   LOTTERY_SHARD_INDEX    - 本进程池分片序号（默认 0）
  *   LOG_CONSOLE            - 日志是否打印到终端（默认 false，只写日志文件）
  *   BALANCE_NICKNAME       - 本账号在群里的下注昵称（可选，余额播报归属二次校验）
  *   BALANCE_FLOOR          - 余额停注门槛（默认 0，余额 <= 该值全局停注）
@@ -49,6 +54,15 @@ const DEFAULTS = {
   MESSAGE_RETENTION_DAYS: '90',
   ACTION_RETENTION_DAYS: '180',
   DICE_POLL_INTERVAL_MS: '5000',
+  // 开奖池广播模式：true = 群级代表拉取+广播（推荐）；false = 旧版逐账号轮询
+  LOTTERY_POOL_ENABLED: 'true',
+  // 开奖池跨群拉取并发上限（不同群并行，同群内串行广播保时序）
+  LOTTERY_CONCURRENCY: '8',
+  // 开奖池拓扑目录刷新周期（毫秒）
+  LOTTERY_CATALOG_REFRESH_MS: '30000',
+  // 池分片：按群哈希分片，1 = 单池全量；多进程时 COUNT=总池数、INDEX=各自序号
+  LOTTERY_SHARD_COUNT: '1',
+  LOTTERY_SHARD_INDEX: '0',
   // 控制台日志开关：默认关闭（日志只写文件，终端保持干净）
   LOG_CONSOLE: 'false',
   // 本账号在群里下注时显示的昵称（可选）：余额播报里必须出现它才认领余额
@@ -102,6 +116,26 @@ function loadConfig() {
   ),
   dicePollIntervalMs: parseInt(
     process.env.DICE_POLL_INTERVAL_MS || DEFAULTS.DICE_POLL_INTERVAL_MS,
+    10
+  ),
+  // 开奖池（广播模式轮询）配置
+  lotteryPoolEnabled: String(
+    process.env.LOTTERY_POOL_ENABLED ?? DEFAULTS.LOTTERY_POOL_ENABLED
+  ).toLowerCase() !== 'false',
+  lotteryConcurrency: parseInt(
+    process.env.LOTTERY_CONCURRENCY || DEFAULTS.LOTTERY_CONCURRENCY,
+    10
+  ),
+  lotteryCatalogRefreshMs: parseInt(
+    process.env.LOTTERY_CATALOG_REFRESH_MS || DEFAULTS.LOTTERY_CATALOG_REFRESH_MS,
+    10
+  ),
+  lotteryShardCount: parseInt(
+    process.env.LOTTERY_SHARD_COUNT || DEFAULTS.LOTTERY_SHARD_COUNT,
+    10
+  ),
+  lotteryShardIndex: parseInt(
+    process.env.LOTTERY_SHARD_INDEX || DEFAULTS.LOTTERY_SHARD_INDEX,
     10
   ),
   // 终端日志开关：LOG_CONSOLE=true 才往终端打印，否则只写日志文件

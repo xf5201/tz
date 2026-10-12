@@ -39,6 +39,7 @@ const SessionManager = require('./services/session.manager');
 const AccountService = require('./services/account.service');
 const ListenerService = require('./services/listener.service');
 const DicePollerService = require('./services/dice-poller.service');
+const LotteryPoolService = require('./services/lottery-pool.service');
 const MessageDispatcherService = require('./services/message-dispatcher.service');
 const { StrategyExecutorService } = require('./services/strategy-executor.service');
 const BetSenderService = require('./services/bet-sender.service');
@@ -132,12 +133,29 @@ async function main() {
 
   const listenerService = new ListenerService({ messageDispatcher });
 
-  // 骰子开奖轮询（pc28 crawler 同构）：部分群组服务器不推送实时更新，按群轮询兜底
-  const dicePoller = new DicePollerService({
-    sessionManager,
-    messageDispatcher,
-    intervalMs: config.dicePollIntervalMs,
-  });
+  // 骰子开奖轮询兜底（pc28 crawler 同构）：部分群组服务器不推送实时更新
+  // 开奖池广播模式（LOTTERY_POOL_ENABLED=true，默认）：拓扑目录给每群选 1 个代表账号拉取
+  //   → 群级水位增量过滤 → 广播给 dispatcher（群级扇出给全部在线监听账号 + DB 去重）。
+  //   每轮拉取次数从 Σ(账号×群) 降为 群数，账号侧零拉取、零拓扑查询
+  // 旧版逐账号轮询：设 LOTTERY_POOL_ENABLED=false 回退
+  let dicePoller;
+  if (config.lotteryPoolEnabled) {
+    dicePoller = new LotteryPoolService({
+      sessionManager,
+      messageDispatcher,
+      intervalMs: config.dicePollIntervalMs,
+      concurrency: config.lotteryConcurrency,
+      catalogRefreshMs: config.lotteryCatalogRefreshMs,
+      shardCount: config.lotteryShardCount,
+      shardIndex: config.lotteryShardIndex,
+    });
+  } else {
+    dicePoller = new DicePollerService({
+      sessionManager,
+      messageDispatcher,
+      intervalMs: config.dicePollIntervalMs,
+    });
+  }
 
   // 登录成功后自动挂载该账号的消息监听
   const accountService = new AccountService(sessionManager, {
