@@ -14,7 +14,7 @@ const botUserDao = require('../db/bot-user.dao');
 const { transaction } = require('../db/connection');
 const { maskPhone } = require('../utils/mask.util');
 const logger = require('../utils/logger');
-
+const { getDeviceProfile } = require('../utils/device-profile');
 // 动态判断代理
 function getProxyConfig() {
   if (!process.env.http_proxy && !process.env.HTTP_PROXY) {
@@ -49,10 +49,9 @@ class AccountService {
 
     this._clientOptions = {
       connectionRetries: 3,
-      deviceModel: 'Android',
-      systemVersion: '13',
-      appVersion: '10.15.0',
-      langCode: 'zh',
+      // 与 session.manager 运行时重连共用同一设备指纹（GramJS Issue #452），
+      // 避免"登录 Android / 重连 Unknown"的指纹跳变触发风控
+      ...getDeviceProfile(),
     };
   }
 

@@ -5,6 +5,7 @@ const accountDao = require('../db/account.dao');
 const ruleDao = require('../db/rule.dao');
 const logger = require('../utils/logger');
 const { maskPhone } = require('../utils/mask.util');
+const { getDeviceProfile } = require('../utils/device-profile');
 
 // 动态判断：有 http_proxy 环境变量就走代理，没有就直连
 function getProxyConfig() {
@@ -77,10 +78,11 @@ class SessionManager {
 
     const session = new StringSession(sessionString);
     const proxy = getProxyConfig();
-
     const client = new TelegramClient(session, this.apiId, this.apiHash, {
       connectionRetries: 5,
       retryDelay: 2000,
+      // 设备指纹必须与登录时一致（GramJS Issue #452：缺失/跳变会触发全量踢会话）
+      ...getDeviceProfile(),
       ...(proxy ? { proxy } : {}),
     });
 
