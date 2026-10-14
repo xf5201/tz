@@ -1,3 +1,22 @@
+## [3.4.0] - 2026-10-14
+# 统一 TG 客户端设备指纹（修复 GramJS #452 全量踢会话）
+## 一、问题背景
+- GramJS 未显式传入 deviceModel / systemVersion / appVersion 时默认上报 "Unknown" 占位值，Telegram 风控判定为可疑客户端
+- 典型表现：登录或挂机后 10~20 秒内所有设备会话被吊销（AUTH_KEY_UNREGISTERED），参见 GramJS Issue #452
+- 旧版运行期重连（session.manager.js）构造 TelegramClient 时未传任何设备参数，与登录流程（account.service.js）上报的设备指纹不一致，PM2 重启后指纹跳变
+## 二、新增：统一设备指纹模块（src/utils/device-profile.js）
+- 登录与运行期重连共用同源指纹，彻底消除设备参数跳变
+- 默认值取自真实设备：Redmi K60 Ultra (23078RKD5C) / Android 16 (SDK 36) / Telegram 12.10.1 / zh
+- 支持 .env 覆盖：TG_DEVICE_MODEL / TG_SYSTEM_VERSION / TG_APP_VERSION / TG_LANG_CODE
+## 三、改动明细
+- session.manager.js：initClient 构造 TelegramClient 时接入 getDeviceProfile()（原先裸奔不传设备参数）
+- account.service.js：_clientOptions 由硬编码 Android/13/10.15.0 改为 getDeviceProfile()，与重连路径同源
+- .env.example：补充 4 个设备指纹可选变量及说明
+## 四、部署说明
+- 纯应用层改动：无数据库 schema 变更、无新增 migration
+- 已在生产服务器实测：md5 一致性校验通过、node --check 通过、migrations 全过、error.log 无新增错误
+- 重登账号后建议挂机观察 10~20 分钟，确认不再触发会话吊销
+
 ## [3.3.3] - 2026-10-13
 # 开奖池广播模式（替代逐账号轮询）
 本版本将开奖消息获取方式从「逐账号轮询」升级为「开奖池广播模式」，已在生产服务器实测运行。
