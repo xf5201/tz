@@ -109,6 +109,8 @@ class DashboardHandler {
       latestFailed,
       blockedChats,
       roundProfit,
+      // 规则 × 群 状态（带群名）——面板按群分块，避免多群信息错乱
+      chatStates: ruleStateDao.listByUserWithChat(botUserId),
     };
   }
 

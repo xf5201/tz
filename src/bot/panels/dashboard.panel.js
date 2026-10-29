@@ -1,9 +1,9 @@
 // src/bot/panels/dashboard.panel.js
 const { Markup } = require('telegraf');
 const { maskPhone, maskChatId } = require('../../utils/mask.util');
-const { formatNumber } = require('../../utils/format.util');
-// 余额是否不足以继续下注（与策略执行器同一口径）
-const { isBalanceInsufficient } = require('../../core/rule.engine');
+const { formatNumber, truncate } = require('../../utils/format.util');
+// 余额是否不足以继续下注（与策略执行器同一口径）；方向标签（大小/定位胆号码组）
+const { isBalanceInsufficient, directionLabel } = require('../../core/rule.engine');
 
 /**
  * 主面板（DashboardPanel）
@@ -17,7 +17,7 @@ class DashboardPanel {
 
   static buildText({
     user, account, chats, rules, throughput, todayProfit, latestFailed,
-    blockedChats = [], roundProfit = null,
+    blockedChats = [], roundProfit = null, chatStates = [],
   }) {
     let text = '🎲 <b>TG 群监听下注助手</b>\n';
     text += '━━━━━━━━━━━━━━━━━━━━\n';
@@ -113,11 +113,39 @@ class DashboardPanel {
       const enabled = rules.filter((r) => r.enabled === 1);
       text += `📌 规则：${enabled.length}/${rules.length} 条启用\n`;
       for (const rule of enabled.slice(0, 5)) {
-        text += `   ·连${rule.streak_count}把反买（基础 ${rule.base_bet} × ${rule.martingale_ratio}）\n`;
+        const isSpec = Number(rule.mode) === 1;
+        const modeTag = isSpec ? '🎯5数' : '🔄大小';
+        const triggerTxt = isSpec ? '每期' : `连${rule.streak_count}把触发`;
+        text += `   ${modeTag}·${triggerTxt}（基础 ${rule.base_bet} × ${rule.martingale_ratio}）\n`;
       }
       if (enabled.length > 5) text += `   …等共 ${enabled.length} 条\n`;
     } else {
       text += '📌 规则：未配置\n';
+    }
+    // ── 按群分块展示「规则 × 群」实时状态（每群独立小节，互不串行） ──
+    if (chatStates && chatStates.length > 0) {
+      const byChat = new Map();
+      for (const s of chatStates) {
+        if (!byChat.has(s.chat_id)) byChat.set(s.chat_id, { title: s.chat_title, rows: [] });
+        byChat.get(s.chat_id).rows.push(s);
+      }
+      text += '👥 群内状态（按群分开）：\n';
+      for (const [chatId, info] of byChat) {
+        const title = info.title || maskChatId(chatId);
+        text += ` ▪ <b>${truncate(title, 16)}</b>\n`;
+        for (const s of info.rows.slice(0, 4)) {
+          const lossTxt = s.consecutive_losses > 0 ? `连败${s.consecutive_losses}` : '连败0';
+          const statusTxt = s.blocked
+            ? '⛔停注'
+            : s.pending_direction
+              ? `⏳挂起「${directionLabel(s.pending_direction)}」`
+              : s.armed_direction
+                ? `🎯待发「${directionLabel(s.armed_direction)}」`
+                : '👁监听中';
+          text += `   规则${s.rule_id}：${statusTxt}｜${lossTxt}\n`;
+        }
+        if (info.rows.length > 4) text += `   …共 ${info.rows.length} 条规则\n`;
+      }
     }
 
     text += `⚡ 近10分钟开奖：${throughput ?? 0} 条\n`;

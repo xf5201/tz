@@ -64,7 +64,7 @@ class RulePanel {
       }
       text += '\n';
       buttons.push([Markup.button.callback(
-        `${state} 连${rule.streak_count}把反买｜基础${rule.base_bet}｜${rule.martingale_ratio}x`,
+        `${state} 连${rule.streak_count}把${Number(rule.mode) === 1 ? '五数' : '反买'}｜基础${rule.base_bet}｜${rule.martingale_ratio}x`,
         `rule:edit:${rule.id}`
       )]);
     }
@@ -81,30 +81,44 @@ class RulePanel {
   // ═══════════════════════════════════════════
   static buildWizard({ draft = {} }) {
     const isEdit = draft.editId != null;
+    const mode1 = draft.mode === 1;
     let text = `${isEdit ? '✏️ 编辑规则' : '🆕 新建规则'}（逐项点击下方按钮）\n`;
     text += '━━━━━━━━━━━━━━━━━━━━\n';
-    text += `🎲 模式：动态监测\n`;
-    text += `🔢 连续次数：${draft.streak_count ?? '⬜'} 把\n`;
-    text += `💡 触发：连续 N 把开「大」→ 自动买「小」\n`;
-    text += `💡 　　　连续 N 把开「小」→ 自动买「大」\n`;
+    text += `🎲 模式：${mode1 ? '🎯 五数定位胆（独立规则）' : '🔄 大小反买'}\n`;
+    if (mode1) {
+      text += '💡 触发：每期开奖后自动下注——取「最近出现的 5 个不同数」\n';
+      text += '💡 　　　每个数各下一注「定位胆N 金额」（5 行合一条消息）\n';
+      text += '💡 　　　无需设置连续次数\n';
+    } else {
+      text += `🔢 连续次数：${draft.streak_count ?? '⬜'} 把\n`;
+      text += '💡 触发：连续 N 把开「大」→ 自动买「小」\n';
+      text += '💡 　　　连续 N 把开「小」→ 自动买「大」\n';
+    }
     text += `👥 作用范围：全部已勾选的监听群\n`;
     text += '━━━━━━━━━━━━━━━━━━━━\n';
-    text += `💰 金额：${draft.base_bet ?? '⬜'}\n`;
+text += `💰 初始下注：${draft.base_bet ?? '⬜'}\n`;
     text += `📈 倍投：${draft.martingale_ratio ? `${draft.martingale_ratio}x` : '⬜'}\n`;
-    text += `🛑 连败上限：${draft.max_lose_streak ?? '⬜'}\n`;
-    text += `⚖️ 止损上限：${draft.stop_loss != null ? draft.stop_loss : '不限'}\n`;
-    text += `⏱ 最小间隔：${draft.min_interval ?? 3}s\n`;
+    text += `🛑 连败停止：${draft.max_lose_streak ?? '⬜'}\n`;
+    if (!mode1) {
+      text += `⚖️ 止损上限：${draft.stop_loss != null ? draft.stop_loss : '不限'}\n`;
+      text += `⏱ 最小间隔：${draft.min_interval ?? 3}s\n`;
+    }
     text += '━━━━━━━━━━━━━━━━━━━━\n';
-
     const buttons = [
+      [Markup.button.callback(
+        mode1 ? '🎯 模式：五数定位胆（点此切换）' : '🔄 模式：大小反买（点此切换）',
+        'rule:w_mode'
+      )],
       [Markup.button.callback(`🔢 连续次数：${draft.streak_count ?? '?'}`, 'rule:w_streak')],
       [Markup.button.callback(`💰 金额：${draft.base_bet ?? '?'}`, 'rule:w_base')],
       [Markup.button.callback(`📈 倍投：${draft.martingale_ratio ? draft.martingale_ratio + 'x' : '?'}`, 'rule:w_ratio')],
-      [
-        Markup.button.callback(`🛑 连败：${draft.max_lose_streak ?? '?'}`, 'rule:w_maxlose'),
-        Markup.button.callback(`⚖️ 止损：${draft.stop_loss != null ? draft.stop_loss : '不限'}`, 'rule:w_stop'),
-        Markup.button.callback(`⏱ 间隔：${draft.min_interval ?? 3}s`, 'rule:w_minint'),
-      ],
+      mode1
+        ? [Markup.button.callback(`🛑 连败停止：${draft.max_lose_streak ?? '?'}`, 'rule:w_maxlose')]
+        : [
+            Markup.button.callback('🛑 连败：' + (draft.max_lose_streak ?? '?'), 'rule:w_maxlose'),
+            Markup.button.callback(`⚖️ 止损：${draft.stop_loss != null ? draft.stop_loss : '不限'}`, 'rule:w_stop'),
+            Markup.button.callback(`⏱ 间隔：${draft.min_interval ?? 3}s`, 'rule:w_minint'),
+          ],
     ];
 
     if (isEdit) {

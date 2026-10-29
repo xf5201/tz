@@ -46,7 +46,7 @@ class ReportPanel {
     for (const b of bets) {
       // 时间去掉日期只留 时:分:秒
       const time = (b.created_at || '').split(' ')[1] || b.created_at;
-      const dir = b.direction === 'BIG' ? '大' : '小';
+      const dir = require('../../core/rule.engine').directionLabel(b.direction);
       let result;
       if (b.status === 'DRY_RUN') {
         // 模拟注：按开奖点数判定，无盈亏金额

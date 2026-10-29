@@ -53,8 +53,8 @@ const ruleDao = {
     const info = db.prepare(`
       INSERT INTO rules (
         bot_user_id, name, streak_count, base_bet, martingale_ratio,
-        max_lose_streak, stop_loss, min_interval, dry_run, enabled
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        max_lose_streak, stop_loss, min_interval, mode, dry_run, enabled
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       String(data.bot_user_id),
       data.name || null,
@@ -64,12 +64,12 @@ const ruleDao = {
       data.max_lose_streak || 6,
       data.stop_loss ?? null,
       data.min_interval ?? 3,
+      data.mode === 1 ? 1 : 0,
       data.dry_run ? 1 : 0,
       data.enabled === 0 ? 0 : 1
     );
     return info.lastInsertRowid;
   },
-
   /**
    * 更新规则（部分字段）
    * @param {number} id
@@ -79,7 +79,7 @@ const ruleDao = {
     const db = getConnection();
     const allowed = [
       'name', 'streak_count', 'base_bet', 'martingale_ratio',
-      'max_lose_streak', 'stop_loss', 'min_interval', 'dry_run', 'enabled',
+      'max_lose_streak', 'stop_loss', 'min_interval', 'mode', 'dry_run', 'enabled',
     ];
     const sets = [];
     const values = [];

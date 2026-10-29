@@ -228,6 +228,22 @@ const ruleStateDao = {
       WHERE r.bot_user_id = ?
     `).all(String(botUserId));
   },
+  /**
+   * 用户全部规则状态（带群名，按群分组排序）—— 主面板「按群分块」展示用
+   * 每个「规则 × 群」一行，互不合并，避免多群信息错乱
+   */
+  listByUserWithChat(botUserId) {
+    const db = getConnection();
+    return db.prepare(`
+      SELECT s.*, mc.chat_title
+      FROM rule_chat_state s
+      JOIN rules r ON r.id = s.rule_id
+      LEFT JOIN monitored_chats mc
+        ON mc.bot_user_id = r.bot_user_id AND mc.chat_id = s.chat_id
+      WHERE r.bot_user_id = ?
+      ORDER BY s.chat_id, s.rule_id
+    `).all(String(botUserId));
+  },
 
   /**
    * 全局挂起下注笔数（启动恢复日志）

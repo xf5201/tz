@@ -112,11 +112,13 @@ function calcAmount(base, ratio, losses) {
  * 必须与 calcAmount 保持完全一致（逐项复用），
  * 否则止损阈值和实际投出去的钱对不上。
  */
-function calcCumulativeStake(base, ratio, losses) {
+function calcCumulativeStake(base, ratio, losses, mode) {
+  // SPEC_FIVE（mode=1）一注 = 5 个数各一份，累计投入按 5 倍计（与实际扣款一致）
+  const multiple = Number(mode) === 1 ? NUMBERS_PER_BET : 1;
   const l = Number(losses) || 0;
   let total = 0;
   for (let i = 0; i <= l; i++) {
-    total += calcAmount(base, ratio, i);
+    total += calcAmount(base, ratio, i) * multiple;
   }
   return total;
 }
@@ -127,6 +129,87 @@ function calcCumulativeStake(base, ratio, losses) {
 function buildBetText(direction, amount) {
   const label = direction === 'BIG' ? '大' : '小';
   return `${label} ${amount}`;
+}
+// ═══════════════════════════════════════════
+// 定位胆策略（v3.4.0 调整：每次买 5 个数）
+// 触发条件不变（连击 N 次触发），下注对象从「大/小」改为「号码组」：
+//   状态列（armed_direction / pending_direction）与 action_logs.direction
+//   存逗号分隔号码串，如 "1,2,3,5,6"；'BIG'/'SMALL' 旧值仍可解析（兼容历史记录）。
+// ═══════════════════════════════════════════
+/**
+ * 每注覆盖的点数个数：1–6 中排除上期开奖数 = 5 个
+ */
+const NUMBERS_PER_BET = 5;
+/**
+ * 定位胆赔付倍率（含本金：中一注返还 每注金额 × 5.8，净利 = 5.8A - 5A = 0.8A）
+ * 环境变量 DICE_SPEC_PAYOUT 可覆盖。
+ * 影响：伴随注的盈利估算（无结算消息解析时的兜底口径），不影响真实输赢判定。
+ */
+function locationPayoutOdds() {
+  const n = parseFloat(process.env.DICE_SPEC_PAYOUT);
+  return Number.isFinite(n) && n > 1 ? n : 5.8;
+}
+/**
+ * 选号策略 v2（主人定：取「最近出现的 5 个不同数」，去重，按出现先后回看）
+ * 例：开奖序列（新→旧）3,4,5,3,1 → 从最新往回收集不同数：3,4,5,1 →
+ *     继续回看直到凑满 5 个；若历史整体不足 5 个不同数，
+ *     用 1–6 中尚未收集的数补齐（保证永远恰好 5 注）。
+ *
+ * @param {number[]} recentValues - 本群历史开奖点数（新→旧）
+ * @returns {number[]} 恰好 5 个点数（升序输出，便于指令稳定）
+ */
+function pickNumbers(recentValues) {
+  const seen = [];
+  for (const v of (recentValues || [])) {
+    const n = Number(v);
+    if (Number.isInteger(n) && n >= 1 && n <= 6 && !seen.includes(n)) seen.push(n);
+    if (seen.length >= NUMBERS_PER_BET) break;
+  }
+  // 历史不足 5 个不同数 → 用未出现的数补齐
+  for (const n of [1, 2, 3, 4, 5, 6]) {
+    if (seen.length >= NUMBERS_PER_BET) break;
+    if (!seen.includes(n)) seen.push(n);
+  }
+  return seen.slice(0, NUMBERS_PER_BET).sort((a, b) => a - b);
+}
+/**
+ * 生成定位胆下注指令文本：一行一个数，合成一条消息，如
+ *   "定位胆4 1\n定位胆2 1\n..."
+ */
+function buildBetTextForNumbers(numbers, amount) {
+  return numbers.map((n) => `定位胆${n} ${amount}`).join('\n');
+}
+/**
+ * 方向/号码组 → 可读标签（日志、面板显示用）
+ * 'BIG' → '大'；'SMALL' → '小'；'1,2,3,5,6' → '定位胆1/2/3/5/6'
+ */
+function directionLabel(direction) {
+  const s = String(direction || '');
+  if (s.includes('&')) {
+    return s.split('&').map((p) => directionLabel(p)).join(' + ');
+  }
+  if (s === 'BIG') return '大';
+  if (s === 'SMALL') return '小';
+  return s
+    .split(',')
+    .filter((x) => x !== '')
+    .map((n) => `定位胆${n}`)
+    .join('/');
+}
+/**
+ * 点数判中：号码组含该点数即中；'BIG'/'SMALL' 旧值走原大小判定
+ *
+ * @param {string} direction - '1,2,3,5,6' 或 'BIG'/'SMALL'
+ * @param {number} diceValue - 1–6
+ * @returns {boolean}
+ */
+function isDirectionHit(direction, diceValue) {
+  if (direction === 'BIG' || direction === 'SMALL') return sizeOf(diceValue) === direction;
+  const nums = String(direction)
+    .split(',')
+    .map((s) => parseInt(s, 10))
+    .filter((n) => Number.isInteger(n));
+  return nums.includes(Number(diceValue));
 }
 
 /**
@@ -153,7 +236,10 @@ function balanceFloor() {
 function minBaseBet(rules) {
   const bases = (rules || [])
     .filter((r) => r.enabled === 1)
-    .map((r) => Number(r.base_bet))
+    .map((r) => (
+      // SPEC_FIVE（mode=1）一注 = 5 个数各一份，实际占用 5×base
+      Number(r.mode) === 1 ? Number(r.base_bet) * NUMBERS_PER_BET : Number(r.base_bet)
+    ))
     .filter((n) => Number.isFinite(n) && n > 0);
   return bases.length ? Math.min(...bases) : 0;
 }
@@ -183,13 +269,33 @@ function isBalanceInsufficient(balance, rules) {
   return minBet > 0 && b < minBet;
 }
 
+/** 是否为大小方向（否则视为定位胆号码组） */
+function isBigSmallDirection(direction) {
+  return direction === 'BIG' || direction === 'SMALL';
+}
 /**
- * 生成规则的可读描述
+ * 拆分最终方向 → { big, spec }
+ * 'BIG'            → { big: 'BIG',  spec: null }
+ * '1,2,3,5,6'      → { big: null,   spec: '1,2,3,5,6' }
+ * 'BIG&1,2,3,5,6'  → { big: 'BIG',  spec: '1,2,3,5,6' }
+ */
+function splitDirectionParts(direction) {
+  const s = String(direction || '');
+  if (!s.includes('&')) {
+    return { big: isBigSmallDirection(s) ? s : null, spec: isBigSmallDirection(s) ? null : s };
+  }
+  const [big, spec] = s.split('&');
+  return { big: big || null, spec: spec || null };
+}
+/**
+ * 生成规则的可读描述（按玩法模式）
  */
 function describeRule(rule) {
+  if (Number(rule?.mode) === 1) {
+    return `每期开奖后自动下注 → 买「最近 5 个不同数」定位胆（赔率 5.8，每数一份额，独立规则）`;
+  }
   return `连续 ${rule.streak_count} 次开出「大」→ 买「小」；连续 ${rule.streak_count} 次开出「小」→ 买「大」`;
 }
-
 module.exports = {
   sizeOf,
   opposite,
@@ -198,7 +304,16 @@ module.exports = {
   calcCumulativeStake,
   buildBetText,
   describeRule,
-  balanceFloor,
+balanceFloor,
   minBaseBet,
   isBalanceInsufficient,
+  // 定位胆策略
+  NUMBERS_PER_BET,
+  locationPayoutOdds,
+  pickNumbers,
+  buildBetTextForNumbers,
+  directionLabel,
+  isDirectionHit,
+  isBigSmallDirection,
+  splitDirectionParts,
 };

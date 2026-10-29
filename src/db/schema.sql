@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS rules (
     max_lose_streak    INTEGER NOT NULL DEFAULT 6,
     stop_loss          REAL NULL,
     min_interval       INTEGER NOT NULL DEFAULT 3,
+    -- 玩法模式：0=CLASSIC 大小反打（原玩法） 1=SPEC_FIVE 大小+伴随5数定位胆
+    mode               INTEGER NOT NULL DEFAULT 0 CHECK(mode IN (0,1)),
     dry_run            INTEGER NOT NULL DEFAULT 0
                        CHECK(dry_run IN (0,1)),
     enabled            INTEGER NOT NULL DEFAULT 1

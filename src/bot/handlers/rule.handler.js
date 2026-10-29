@@ -92,6 +92,10 @@ class RuleHandler {
         await this.renderSub(ctx, botUserId, 'wizard', { panelRenderer });
         break;
 
+      case 'w_mode':
+        await this.handleModeToggle(ctx, botUserId, { panelRenderer });
+        break;
+
       case 'w_confirm':
         await this.handleConfirm(ctx, botUserId, { panelRenderer, services });
         break;
@@ -142,7 +146,20 @@ class RuleHandler {
 
   static async handleNew(ctx, botUserId, { panelRenderer }) {
     // 模拟 / 实发已改为账号级开关（主面板切换），规则层不再单独控制
-    const draft = {};
+    const draft = { mode: 0 };
+    ctx.services.panelContextDao.updateWizardState(botUserId, JSON.stringify({
+      scene: 'rule_wizard', draft,
+    }));
+    await panelRenderer.render(ctx, 'rule_wizard', { draft });
+  }
+  /**
+   * 玩法模式切换：CLASSIC（大小反买，mode=0）↔ SPEC_FIVE（五数定位胆，mode=1）
+   * 仅影响该规则本身的下注方式；两类规则各自独立配置/启用/挂起/结算。
+   */
+  static async handleModeToggle(ctx, botUserId, { panelRenderer }) {
+    const state = this._loadDraft(ctx, botUserId);
+    const draft = state.draft;
+    draft.mode = Number(draft.mode) === 1 ? 0 : 1;
     ctx.services.panelContextDao.updateWizardState(botUserId, JSON.stringify({
       scene: 'rule_wizard', draft,
     }));
@@ -161,6 +178,7 @@ class RuleHandler {
       max_lose_streak: rule.max_lose_streak,
       stop_loss: rule.stop_loss,
       min_interval: rule.min_interval,
+      mode: Number(rule.mode) === 1 ? 1 : 0,
       enabled: rule.enabled === 1,
     };
 
@@ -273,22 +291,27 @@ class RuleHandler {
     const state = this._loadDraft(ctx, botUserId);
     const draft = state.draft;
 
-    // 校验必填项
+    // 校验必填项：五数定位胆（mode=1）每期直接下注，不需要连续次数
     const missing = [];
-    if (!draft.streak_count) missing.push('连续次数');
-    if (!draft.base_bet) missing.push('基础金额');
+    if (Number(draft.mode) === 1) {
+      if (!draft.base_bet) missing.push('基础金额');
+      draft.streak_count = 1; // 兼容表结构非空约束，仅作占位
+    } else {
+      if (!draft.streak_count) missing.push('连续次数');
+      if (!draft.base_bet) missing.push('基础金额');
+    }
     if (missing.length > 0) {
       throw new Error(`尚有未完成项：${missing.join('、')}`);
     }
-
     const fields = {
-      name: `连${draft.streak_count}把反买`,
+      name: Number(draft.mode) === 1 ? `每期五数${draft.base_bet}` : `连${draft.streak_count}把反买`,
       streak_count: draft.streak_count,
       base_bet: draft.base_bet,
       martingale_ratio: draft.martingale_ratio ?? 2.0,
       max_lose_streak: draft.max_lose_streak ?? 6,
-      stop_loss: draft.stop_loss ?? null,
-      min_interval: draft.min_interval ?? 3,
+      stop_loss: Number(draft.mode) === 1 ? null : (draft.stop_loss ?? null),
+      min_interval: Number(draft.mode) === 1 ? 0 : (draft.min_interval ?? 3),
+      mode: Number(draft.mode) === 1 ? 1 : 0,
       dry_run: 0,
     };
 

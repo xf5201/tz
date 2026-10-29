@@ -8,7 +8,9 @@ const operationLogDao = require('../db/operation-log.dao');
 const chatOddsDao = require('../db/chat-odds.dao');
 const { transaction } = require('../db/connection');
 const {
-  evaluateStreak, calcAmount, calcCumulativeStake, buildBetText, isBalanceInsufficient, sizeOf,
+  evaluateStreak, calcAmount, calcCumulativeStake, buildBetText, isBalanceInsufficient,
+  NUMBERS_PER_BET, locationPayoutOdds, pickNumbers, buildBetTextForNumbers,
+  directionLabel, isDirectionHit, splitDirectionParts,
 } = require('../core/rule.engine');
 const { parseSettle, parseWindowPeriod } = require('../core/dice.parser');
 const {
@@ -280,7 +282,11 @@ class StrategyExecutorService {
 
         const direction = state.armed_direction;
         const amount = calcAmount(rule.base_bet, rule.martingale_ratio, state.consecutive_losses);
-        const actionText = buildBetText(direction, amount);
+        // SPEC_FIVE（mode=1）：方向为号码组 → 指令 = 每个数一行「定位胆N 金额」，合成一条消息
+        const dirParts = splitDirectionParts(direction);
+        const actionText = dirParts.spec && !dirParts.big
+          ? buildBetTextForNumbers(dirParts.spec.split(','), amount)
+          : buildBetText(direction, amount);
         const isDry = this._simOf(botUserId);
 
         const actionId = actionLogDao.insert({
@@ -412,7 +418,7 @@ class StrategyExecutorService {
           if (dry && settle.diceValue != null
             && (!dry.round_period || !settle.period || dry.round_period === settle.period)) {
             const isWin = this._judgeWin(dry.direction, settle.diceValue);
-            const dryProfit = isWin ? this._winProfit(chatId, dry.bet_amount) : -dry.bet_amount;
+            const dryProfit = this._profitFor(chatId, dry.direction, dry.bet_amount, isWin);
             settledCount += this._applySettlement(
               botUserId, rule, chatId, dry, settle.diceValue, isWin, dryProfit,
               state, blockedChats, '模拟结算'
@@ -452,7 +458,7 @@ class StrategyExecutorService {
             const isWin = this._judgeWin(pending.direction, settle.diceValue);
             const profit = (settle.matched && settle.isWin && settle.profit != null)
               ? settle.profit
-              : (isWin ? this._winProfit(chatId, pending.bet_amount) : -pending.bet_amount);
+              : (this._profitFor(chatId, pending.direction, pending.bet_amount, isWin));
             settledCount += this._applySettlement(
               botUserId, rule, chatId, pending, settle.diceValue, isWin, profit,
               state, blockedChats, '结算消息'
@@ -468,7 +474,7 @@ class StrategyExecutorService {
             && (!dry.round_period || !settle.period || dry.round_period === settle.period)) {
             const isWin = this._judgeWin(dry.direction, settle.diceValue);
             // 与实发同口径：赢按群赔率算净盈利，输 = 本金
-            const dryProfit = isWin ? this._winProfit(chatId, dry.bet_amount) : -dry.bet_amount;
+            const dryProfit = this._profitFor(chatId, dry.direction, dry.bet_amount, isWin);
             settledCount += this._applySettlement(
               botUserId, rule, chatId, dry, settle.diceValue, isWin, dryProfit,
               state, blockedChats, '模拟结算'
@@ -589,13 +595,15 @@ class StrategyExecutorService {
   }
 
   /**
-   * 点数判输赢：大=4-6 / 小=1-3，与下注方向比对
-   * @param {string} direction - 'BIG'|'SMALL'
+   * 点数判输赢：
+   *   大/小方向（'BIG'/'SMALL'）：大=4-6 / 小=1-3 比对
+   *   号码组（'1,2,3,5,6'，SPEC_FIVE 模式）：开奖点数在组内即中
+   * @param {string} direction - 'BIG'|'SMALL'|'1,2,3,5,6'
    * @param {number} diceValue - 1-6
    * @returns {0|1}
    */
   _judgeWin(direction, diceValue) {
-    return sizeOf(diceValue) === direction ? 1 : 0;
+    return isDirectionHit(direction, diceValue) ? 1 : 0;
   }
 
   /**
@@ -604,6 +612,27 @@ class StrategyExecutorService {
   _oddsFor(chatId) {
     const learned = chatOddsDao.getOdds(chatId);
     return learned != null ? learned : DEFAULT_PAYOUT_ODDS;
+  }
+
+  /**
+   * 一手下注的盈亏估算（按方向类型取口径，带符号）
+   *   大/小（CLASSIC）：
+   *     赢 = 本金 × 群赔率（约 0.95）　输 = -本金
+   *   定位胆（SPEC_FIVE，一注 = 5 个数各 A，总投入 5A，赔率 5.8 含本金）：
+   *     赢（开奖数命中组内）= 5.8A − 5A = +0.8A
+   *     输（未命中，5 注全黑）= −5A
+   * 仅用于实时路径（骰子/兜底/确认补结算）拿不到结算消息解析盈亏时的兜底，
+   * 以及模拟模式的资金推演；真实盈亏以结算消息解析为准。
+   */
+  _profitFor(chatId, direction, betAmount, isWin) {
+    const parts = splitDirectionParts(direction);
+    const a = Number(betAmount);
+    if (parts.spec && !parts.big) {
+      return isWin
+        ? Math.round(a * (locationPayoutOdds() - NUMBERS_PER_BET) * 100) / 100
+        : Math.round(-a * NUMBERS_PER_BET * 100) / 100;
+    }
+    return isWin ? this._winProfit(chatId, a) : -a;
   }
 
   /**
@@ -652,7 +681,7 @@ class StrategyExecutorService {
       const dry = actionLogDao.getLatestUnsettledDry(rule.id, chatId);
       if (dry && dice.value != null) {
         const isWin = this._judgeWin(dry.direction, dice.value);
-        const profit = isWin ? this._winProfit(chatId, dry.bet_amount) : -dry.bet_amount;
+        const profit = this._profitFor(chatId, dry.direction, dry.bet_amount, isWin);
         return this._applySettlement(
           botUserId, rule, chatId, dry, dice.value, isWin, profit,
           state, blockedChats, '模拟骰子'
@@ -705,7 +734,7 @@ class StrategyExecutorService {
     }
 
     const isWin = this._judgeWin(pending.direction, dice.value);
-    const profit = isWin ? this._winProfit(chatId, pending.bet_amount) : -pending.bet_amount;
+    const profit = this._profitFor(chatId, pending.direction, pending.bet_amount, isWin);
     return this._applySettlement(
       botUserId, rule, chatId, pending, dice.value, isWin, profit,
       state, blockedChats, '骰子'
@@ -729,7 +758,7 @@ class StrategyExecutorService {
         const dice = this._findDiceForBet(chatId, beijingTimeToMs(dry.created_at));
         if (dice) {
           const isWin = this._judgeWin(dry.direction, dice.value);
-          const profit = isWin ? this._winProfit(chatId, dry.bet_amount) : -dry.bet_amount;
+          const profit = this._profitFor(chatId, dry.direction, dry.bet_amount, isWin);
           return this._applySettlement(
             botUserId, rule, chatId, dry, dice.value, isWin, profit,
             ruleStateDao.ensure(rule.id, chatId), blockedChats, '模拟兜底'
@@ -759,7 +788,7 @@ class StrategyExecutorService {
     if (!dice) return 0; // 没有任何已捕获点数 → 留给结算消息期号匹配 / 超时巡检
 
     const isWin = this._judgeWin(pending.direction, dice.value);
-    const profit = isWin ? this._winProfit(chatId, pending.bet_amount) : -pending.bet_amount;
+    const profit = this._profitFor(chatId, pending.direction, pending.bet_amount, isWin);
     logger.info(
       `[STRATEGY_EXEC] 开盘兜底结算（上期开奖消息被错过，用已捕获点数）: ` +
       `规则=${rule.id}, 群=${maskChatId(chatId)}, 动作=${pending.action_text}, 点数=${dice.value}`
@@ -810,7 +839,7 @@ class StrategyExecutorService {
     let settledCount = 0;
     transaction(() => {
       const isWin = this._judgeWin(fresh.direction, dice.value);
-      const profit = isWin ? this._winProfit(chatId, fresh.bet_amount) : -fresh.bet_amount;
+      const profit = this._profitFor(chatId, fresh.direction, fresh.bet_amount, isWin);
       settledCount = this._applySettlement(
         botUserId, rule, chatId, fresh, dice.value, isWin, profit,
         state, blockedChats, '发送确认补结算'
@@ -878,7 +907,7 @@ class StrategyExecutorService {
     // 止损硬约束：累计投入（只算「已经真实投出去的钱」，不再多算下一注）
     if (rule.stop_loss != null) {
       const spent = calcCumulativeStake(
-        rule.base_bet, rule.martingale_ratio, Math.max(0, newLosses - 1)
+        rule.base_bet, rule.martingale_ratio, Math.max(0, newLosses - 1), rule.mode
       );
       if (spent >= rule.stop_loss) {
         const reason = `累计投入 ${spent} 已达止损上限 ${rule.stop_loss}`;
@@ -985,23 +1014,33 @@ class StrategyExecutorService {
    * 需在事务内调用
    */
   _tryArm(botUserId, rule, chatId, diceValue, armedRules) {
-    const need = Math.max(2, rule.streak_count || 2);
-    const recentValues = messageLogDao.recentValues(chatId, need + 1).slice(1);
-    const direction = evaluateStreak(rule, diceValue, recentValues);
-    if (!direction) return false;
-
-    ruleStateDao.updateState(rule.id, chatId, { armedDirection: direction });
-    armedRules.push({ rule, chatId, direction });
-
+    let direction;
+    if (Number(rule.mode) === 1) {
+      // SPEC_FIVE：不要连击——每期结算后自动武装下一期；同一期只武装一次
+      // （已有待发/挂起时跳过，避免开奖消息与结算消息重复触发）
+      const nowState = ruleStateDao.ensure(rule.id, chatId);
+      if (nowState.armed_direction || nowState.pending_direction) return false;
+      // 「最近出现的 5 个不同数」：回看最新历史去重取 5 个（不足用未出现数补齐）
+      direction = pickNumbers(messageLogDao.recentValues(chatId, 40).slice(1)).join(',');
+    } else {
+      // CLASSIC（mode=0）：保持原口径——连击满足才武装，反向下注「大/小」
+      const need = Math.max(2, rule.streak_count || 2);
+      const recentValues = messageLogDao.recentValues(chatId, need + 1).slice(1);
+      direction = evaluateStreak(rule, diceValue, recentValues);
+      if (!direction) return false;
+    }
+    const finalDirection = direction;
+    ruleStateDao.updateState(rule.id, chatId, { armedDirection: finalDirection });
+    armedRules.push({ rule, chatId, direction: finalDirection });
     operationLogDao.insert({
       bot_user_id: botUserId,
       action: 'RULE_ARMED',
       detail: `规则「${rule.name || rule.id}」@${maskChatId(chatId)} ` +
-        `连击满足，待发「${direction === 'BIG' ? '大' : '小'}」，等待开盘信号`,
+        `连击满足，待发「${directionLabel(finalDirection)}」，等待开盘信号`,
     });
     logger.info(
       `[STRATEGY_EXEC] 已待发: 用户=${botUserId}, 规则=${rule.id}, ` +
-      `群=${maskChatId(chatId)}, 方向=${direction}（等待底注开盘信号）`
+      `群=${maskChatId(chatId)}, 方向=${finalDirection}（等待底注开盘信号）`
     );
     return true;
   }
