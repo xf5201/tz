@@ -1,4 +1,5 @@
 // src/services/balance-query.service.js
+const tgLimiter = require('../utils/tg-rate-limiter');
 const monitoredChatDao = require('../db/monitored-chat.dao');
 const logger = require('../utils/logger');
 const { maskChatId } = require('../utils/mask.util');
@@ -65,7 +66,9 @@ class BalanceQueryService {
 
     try {
       await Promise.race([
-        client.sendMessage(chatId, { message: '余额' }),
+        tgLimiter.run(chatId, () => client.sendMessage(chatId, { message: '余额' }), {
+          label: `balance.query chat=${chatId}`,
+        }),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error(`发送超时（${SEND_TIMEOUT_MS / 1000}s）`)), SEND_TIMEOUT_MS)
         ),

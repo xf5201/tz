@@ -4,13 +4,15 @@ const ruleDao = require('../db/rule.dao');
 const actionLogDao = require('../db/action-log.dao');
 const operationLogDao = require('../db/operation-log.dao');
 const logger = require('../utils/logger');
+const tgLimiter = require('../utils/tg-rate-limiter');
 const { maskChatId } = require('../utils/mask.util');
-
 // 下注消息发送超时（毫秒）：GramJS 连接假死时 sendMessage 会永久挂起
 // （既不成功也不抛错），必须用超时兜底，否则该期下注会无声丢失。
 const SEND_TIMEOUT_MS = 30000;
 const MAX_RETRIES = 2;
 const RETRY_BACKOFF_MS = [2000, 8000];
+// FLOOD_WAIT 等待上限：下注是强时效动作，等太久这期已经没意义了
+const FLOOD_WAIT_CAP_MS = 20000;
 
 /**
  * 下注消息发送服务
@@ -77,15 +79,28 @@ class BetSenderService {
   }
 
   /**
-   * 带超时保护的消息发送
+   * 带超时保护的消息发送（进限速队列：同群串行+间隔，429/FLOOD_WAIT 不再互相踩踏）
    */
   async _sendWithTimeout(client, chatId, text, timeoutMs = SEND_TIMEOUT_MS) {
     return Promise.race([
-      client.sendMessage(chatId, { message: text }),
+      tgLimiter.run(chatId, () => client.sendMessage(chatId, { message: text }), {
+        label: `bet.mtproto chat=${chatId}`,
+      }),
       new Promise((_, reject) =>
         setTimeout(() => reject(new Error(`发送超时（${timeoutMs / 1000}s）`)), timeoutMs)
       ),
     ]);
+  }
+
+  /**
+   * 从错误中解析 FLOOD_WAIT_<n>（GramJS 限流），返回需等待的毫秒数；非限流返回 null
+   */
+  _parseFloodWaitMs(error) {
+    const m = /FLOOD_WAIT_(\d+)/.exec(error?.errorMessage || error?.message || '');
+    if (m) return Number(m[1]) * 1000;
+    const d = /retry after (\d+)/i.exec(error?.description || error?.message || '');
+    if (d) return Number(d[1]) * 1000;
+    return null;
   }
 
   /**
@@ -116,9 +131,18 @@ class BetSenderService {
       return false;
     }
 
-    // 其他失败：退避重试
+    // 其他失败：退避重试（限流错误按 retry_after/FLOOD_WAIT 实际时长等待）
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS[attempt - 1] || 8000));
+      let backoff = RETRY_BACKOFF_MS[attempt - 1] || 8000;
+      const floodMs = this._parseFloodWaitMs(error);
+      if (floodMs != null) {
+        if (floodMs > FLOOD_WAIT_CAP_MS) {
+          actionLogDao.markFailed(action.id, `限流等待过长(${Math.round(floodMs / 1000)}s)，本期放弃`, attempt);
+          return false;
+        }
+        backoff = floodMs + 300;
+      }
+      await new Promise((r) => setTimeout(r, backoff));
       try {
         const client = this.sessionManager.getClient(botUserId);
         if (!client) throw new Error('TG Client 未连接');

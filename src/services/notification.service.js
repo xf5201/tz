@@ -1,5 +1,6 @@
 // src/services/notification.service.js
 const logger = require('../utils/logger');
+const tgLimiter = require('../utils/tg-rate-limiter');
 // 复用主面板的数据组装（余额 / 停注群 / 今日盈利），保证刷新与推送显示一致
 const DashboardHandler = require('../bot/handlers/dashboard.handler');
 const ReportHandler = require('../bot/handlers/report.handler');
@@ -101,7 +102,11 @@ class NotificationService {
    */
   async notifyEvent(botUserId, text) {
     try {
-      await this.bot.telegram.sendMessage(botUserId, text);
+      botUserId = String(botUserId);
+      // 加入发送队列：与面板推送共用同一聊天（bot 私聊），强制 1条/秒以上间隔，避免 429
+      await tgLimiter.run(botUserId, () => this.bot.telegram.sendMessage(botUserId, text), {
+        label: `notify.event user=${botUserId}`,
+      });
       logger.info(`[NOTIFICATION] 事件通知已发送: 用户=${botUserId}`);
     } catch (error) {
       logger.warn(`[NOTIFICATION] 事件通知发送失败: 用户=${botUserId}, ${error.message}`);

@@ -1,6 +1,6 @@
 // src/bot/panels/panel.renderer.js
 const logger = require('../../utils/logger');
-
+const tgLimiter = require('../../utils/tg-rate-limiter');
 /**
  * 面板渲染器（PanelRenderer）
  *
@@ -58,7 +58,12 @@ class PanelRenderer {
 
     // 辅助函数：发送全新的面板消息并同步数据库记录
     const sendNewAndSave = async () => {
-      const msg = await ctx.reply(text, { parse_mode: 'HTML', reply_markup });
+      // 发送也走限速队列（与事件通知、面板编辑同一聊天，串行+间隔）
+      const msg = await tgLimiter.run(
+        botUserId,
+        () => ctx.reply(text, { parse_mode: 'HTML', reply_markup }),
+        { label: `panel.new user=${botUserId} panel=${panelName}` }
+      );
       this.panelContextDao.upsert(
         botUserId,
         msg.chat.id,
@@ -76,13 +81,17 @@ class PanelRenderer {
     }
 
     try {
-      // 尝试编辑现有面板
-      await this.bot.telegram.editMessageText(
+      // 加入发送队列：面板编辑与事件通知共走限速器，同聊天强制间隔，避免 429
+      await tgLimiter.run(
         panelCtx.chat_id,
-        panelCtx.message_id,
-        null,
-        text,
-        { parse_mode: 'HTML', reply_markup }
+        () => this.bot.telegram.editMessageText(
+          panelCtx.chat_id,
+          panelCtx.message_id,
+          null,
+          text,
+          { parse_mode: 'HTML', reply_markup }
+        ),
+        { label: `panel.render user=${botUserId} panel=${panelName}` }
       );
       // 更新当前面板名称
       this.panelContextDao.updatePanel(botUserId, panelName);
@@ -108,6 +117,12 @@ class PanelRenderer {
       }
 
       // 其他未预期的 API 错误，强行降级重新发送，确保界面能够展示
+      // 但 429 限流例外：限速器已自动重试仍失败，说明当前出口很堵，
+      // 再降级加发新消息只会火上浇油——放弃本次渲染，等下次状态变化再更
+      if (/Too Many Requests|429|retry after/i.test(errDesc)) {
+        logger.warn(`[PANEL] 编辑面板遇限流（重试未成），本次放弃，避免加剧限流: ${errDesc}`);
+        return;
+      }
       logger.error(`[PANEL] 编辑面板失败 (${errDesc})，降级发送新消息`);
       await sendNewAndSave();
     }
@@ -129,12 +144,17 @@ class PanelRenderer {
     const reply_markup = this._normalizeMarkup(keyboard);
 
     try {
-      await this.bot.telegram.editMessageText(
+      // 加入发送队列：推送编辑走限速器（同聊天 1条/秒 + 429 自动重试）
+      await tgLimiter.run(
         panelCtx.chat_id,
-        panelCtx.message_id,
-        null,
-        text,
-        { parse_mode: 'HTML', reply_markup }
+        () => this.bot.telegram.editMessageText(
+          panelCtx.chat_id,
+          panelCtx.message_id,
+          null,
+          text,
+          { parse_mode: 'HTML', reply_markup }
+        ),
+        { label: `panel.push user=${botUserId} panel=${panelName}` }
       );
       logger.debug(`[PANEL] 推送更新: 用户 ${botUserId} → ${panelName}`);
     } catch (err) {
@@ -144,10 +164,15 @@ class PanelRenderer {
       if (errDesc.includes('message to edit not found')) {
         logger.warn(`[PANEL] 用户 ${botUserId} 面板消息已删除，推送自愈重发`);
         try {
-          const msg = await this.bot.telegram.sendMessage(botUserId, text, {
-            parse_mode: 'HTML',
-            reply_markup,
-          });
+          // 自愈重发也进队列（与事件通知同聊天串行，避免 429）
+          const msg = await tgLimiter.run(
+            botUserId,
+            () => this.bot.telegram.sendMessage(botUserId, text, {
+              parse_mode: 'HTML',
+              reply_markup,
+            }),
+            { label: `panel.resend user=${botUserId}` }
+          );
           this.panelContextDao.upsert(
             botUserId,
             msg.chat.id,
