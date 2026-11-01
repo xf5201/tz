@@ -1,6 +1,7 @@
 // src/services/lottery-pool.service.js
 const accountDao = require('../db/account.dao');
 const monitoredChatDao = require('../db/monitored-chat.dao');
+const ruleStateDao = require('../db/rule-state.dao');
 const logger = require('../utils/logger');
 const { maskChatId } = require('../utils/mask.util');
 
@@ -36,6 +37,11 @@ const POLL_MESSAGE_LIMIT = 30;
 
 // 代表账号连续拉取失败多少次后触发目录刷新换代表
 const REP_FAIL_LIMIT = 3;
+// 单群连续拉取失败多少次后判定「群失联」(被踢/退群/被解散)，自动移除监听。
+// 所有代表账号都已不在该群时，换代表救不回来，只会每 5 秒重试一次永远刷 WARN。
+const KICK_FAIL_LIMIT = 12;
+// 「群失联」错误特征：实体解析失败 / 群不存在 / 无权限访问频道
+const KICK_ERR_PATTERN = /input entity|entity.*not.*found|ENTITY|CHANNEL_PRIVATE|CHANNEL_INVALID|chat.*not.*found/i;
 
 class LotteryPoolService {
   /**
@@ -69,6 +75,8 @@ class LotteryPoolService {
     this._watermarks = new Map();
     /** userId -> 连续拉取失败次数（选代表时规避不健康账号） */
     this._repFails = new Map();
+    /** chatId -> 连续「实体解析失败」次数（判定群失联/被踢，达限自动摘群） */
+    this._kickFails = new Map();
     /** 跨群拉取限流器（可跨轮复用） */
     this._limit = this._makeLimit(this.concurrency);
   }
@@ -173,6 +181,30 @@ class LotteryPoolService {
     const sorted = [...listeners].sort((a, b) => failOf(a) - failOf(b));
     return sorted[0] || null;
   }
+  /**
+   * 群失联清理：被踢/退群/解散确认后调用。
+   * 移除监听记录 + 清空该群全部规则运行状态 + 清理内存水位与失联计数，
+   * 若群下已无任何监听，目录刷新后该群自然从拉取拓扑消失。
+   * @param {string} chatId
+   * @param {string} reason - 判定依据（写日志用）
+   */
+  async _purgeExitedChat(chatId, reason) {
+    try {
+      const removed = monitoredChatDao.removeByChat(chatId);
+      const purged = ruleStateDao.purgeByChat(chatId);
+      this._watermarks.delete(chatId);
+      this._kickFails.delete(chatId);
+      logger.warn(
+        `[LOTTERY_POOL] 群 ${maskChatId(chatId)} 已失联(${reason})，` +
+        `自动移除监听 ${removed} 条、清理规则状态 ${purged} 条`
+      );
+      this._refreshCatalog();
+    } catch (err) {
+      logger.error(`[LOTTERY_POOL] 群 ${maskChatId(chatId)} 失联清理异常: ${err.message}`);
+      // 清理失败则清零计数，避免本轮反复触发
+      this._kickFails.delete(chatId);
+    }
+  }
 
   /**
    * 广播单群：代表账号拉取一次 → 群级水位增量过滤 → 逐条广播给分发器
@@ -192,6 +224,7 @@ class LotteryPoolService {
     try {
       msgs = await this._getMessagesWithTimeout(client, chatId, POLL_MESSAGE_LIMIT);
       this._repFails.delete(info.rep); // 成功即重置失败计数
+      this._kickFails.delete(chatId);  // 成功即重置失联计数
     } catch (err) {
       const fails = (this._repFails.get(info.rep) || 0) + 1;
       this._repFails.set(info.rep, fails);
@@ -199,13 +232,20 @@ class LotteryPoolService {
         `[LOTTERY_POOL] 群 ${maskChatId(chatId)} 拉取失败(代表=${info.rep}, ` +
         `连续第${fails}次): ${err.message}`
       );
+      // 群失联检测：实体解析失败类错误 + 连续 12 次(约1分钟) → 判定被踢/退群
+      if (KICK_ERR_PATTERN.test(String(err.message))) {
+        const kf = (this._kickFails.get(chatId) || 0) + 1;
+        this._kickFails.set(chatId, kf);
+        if (kf >= KICK_FAIL_LIMIT) {
+          await this._purgeExitedChat(chatId, `连续 ${kf} 次实体解析失败`);
+        }
+      }
       if (fails >= REP_FAIL_LIMIT) {
         logger.warn(`[LOTTERY_POOL] 代表 ${info.rep} 连续失败 ${fails} 次，刷新拓扑换代表`);
         this._refreshCatalog(); // 下轮起由更健康的账号接管该群
       }
       return;
     }
-
     const watermark = this._watermarks.get(chatId) || 0;
     // 首轮：只建立群级水位（取最新一条消息 ID），不补发历史（避免虚假连击）
     if (watermark === 0) {

@@ -15,8 +15,8 @@ const fs = require('fs');
  *   LOG_LEVEL              - 日志级别（默认 info）
  *   LOG_DIR                - 日志目录（默认 ./logs）
  *   NODE_ENV               - 运行环境（默认 production）
- *   MESSAGE_RETENTION_DAYS - 消息流水保留天数（默认 90）
- *   ACTION_RETENTION_DAYS  - 动作记录保留天数（默认 180）
+ *   MESSAGE_RETENTION_HOURS - 消息流水保留小时数（默认 1）
+ *   ACTION_RETENTION_HOURS  - 动作记录保留小时数（默认 1）
  *   DICE_POLL_INTERVAL_MS  - 开奖轮询间隔（默认 5000）
  *   LOTTERY_POOL_ENABLED   - 开奖池广播模式开关（默认 true；false = 旧版逐账号轮询）
  *   LOTTERY_CONCURRENCY    - 开奖池跨群拉取并发上限（默认 8）
@@ -51,8 +51,8 @@ const DEFAULTS = {
   LOG_LEVEL: 'info',
   LOG_DIR: './logs',
   NODE_ENV: 'production',
-  MESSAGE_RETENTION_DAYS: '90',
-  ACTION_RETENTION_DAYS: '180',
+  MESSAGE_RETENTION_HOURS: '1',
+  ACTION_RETENTION_HOURS: '1',
   DICE_POLL_INTERVAL_MS: '5000',
   // 开奖池广播模式：true = 群级代表拉取+广播（推荐）；false = 旧版逐账号轮询
   LOTTERY_POOL_ENABLED: 'true',
@@ -106,12 +106,12 @@ function loadConfig() {
     logLevel: process.env.LOG_LEVEL || DEFAULTS.LOG_LEVEL,
     logDir: process.env.LOG_DIR || DEFAULTS.LOG_DIR,
     nodeEnv: process.env.NODE_ENV || DEFAULTS.NODE_ENV,
-    messageRetentionDays: parseInt(
-      process.env.MESSAGE_RETENTION_DAYS || DEFAULTS.MESSAGE_RETENTION_DAYS,
+    messageRetentionHours: parseInt(
+      process.env.MESSAGE_RETENTION_HOURS || DEFAULTS.MESSAGE_RETENTION_HOURS,
       10
     ),
-  actionRetentionDays: parseInt(
-    process.env.ACTION_RETENTION_DAYS || DEFAULTS.ACTION_RETENTION_DAYS,
+  actionRetentionHours: parseInt(
+    process.env.ACTION_RETENTION_HOURS || DEFAULTS.ACTION_RETENTION_HOURS,
     10
   ),
   dicePollIntervalMs: parseInt(

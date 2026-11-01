@@ -9,10 +9,12 @@ const chatOddsDao = require('../db/chat-odds.dao');
 const { transaction } = require('../db/connection');
 const {
   evaluateStreak, calcAmount, calcCumulativeStake, buildBetText, isBalanceInsufficient,
-  NUMBERS_PER_BET, locationPayoutOdds, pickNumbers, buildBetTextForNumbers,
+  NUMBERS_PER_BET, locationPayoutOdds, calcSpecProfit, pickNumbers, buildBetTextForNumbers,
   directionLabel, isDirectionHit, splitDirectionParts,
 } = require('../core/rule.engine');
-const { parseSettle, parseWindowPeriod } = require('../core/dice.parser');
+const {
+  parseSettle, parseSettleSpecLines, parseSettleSizeLines, parseWindowPeriod,
+} = require('../core/dice.parser');
 const {
   calcRoundProfit, isTakeProfitReached, isBaselineStale, beijingDate,
 } = require('../core/profit.guard');
@@ -282,19 +284,35 @@ class StrategyExecutorService {
 
         const direction = state.armed_direction;
         const amount = calcAmount(rule.base_bet, rule.martingale_ratio, state.consecutive_losses);
-        // SPEC_FIVE（mode=1）：方向为号码组 → 指令 = 每个数一行「定位胆N 金额」，合成一条消息
+        // SPEC_FIVE（mode=1）：方向为号码组 → 指令 = 每个数一行「定位胆N 金额」，合成一条消息；
+        // bet_amount 存整组总投入（5×amount，2026-10-31 口径修正），实发单注金额仍是 amount
         const dirParts = splitDirectionParts(direction);
-        const actionText = dirParts.spec && !dirParts.big
+        const isSpec = dirParts.spec && !dirParts.big;
+
+        // 防御性兜底：跳把标记在 _tryArm 已消费，正常不会武装成功后仍带着标记。
+        // 万一带着（进程中途改配置等），这里最后一道闸挡住：本把不下注、清标记。
+        if (isSpec && Number(state.skip_round) === 1) {
+          ruleStateDao.consumeSkipRound(rule.id, chatId);
+          logger.warn(
+            `[STRATEGY_EXEC] 定位胆武装带隔把标记（异常），已跳过本轮并清除: ` +
+            `规则=${rule.id}, 群=${maskChatId(chatId)}`
+          );
+          continue;
+        }
+
+        const actionText = isSpec
           ? buildBetTextForNumbers(dirParts.spec.split(','), amount)
           : buildBetText(direction, amount);
+        const totalStake = isSpec ? amount * NUMBERS_PER_BET : amount;
         const isDry = this._simOf(botUserId);
-
         const actionId = actionLogDao.insert({
           bot_user_id: botUserId,
           rule_id: rule.id,
           chat_id: chatId,
           direction,
-          bet_amount: amount,
+          bet_amount: totalStake,
+          // 011 迁移：显式记录单注金额，赢单估算不再靠 bet_amount ÷ 5 反推
+          stake_per_number: isSpec ? amount : null,
           action_text: actionText,
           status: isDry ? 'DRY_RUN' : 'CREATED',
           round_period: period,
@@ -304,13 +322,15 @@ class StrategyExecutorService {
         // 必须在这里占位，不能等发送成功再置 —— 否则发送耗时期间（最长 30s）
         // 若同一条开盘消息被 NewMessage 与轮询兜底重复投递，会再建一条下注＝重复下注。
         // 发送失败时再在下方回滚 pending（本轮放弃），不会卡死。
+        // 同时：定位胆下注的这一把点亮「隔把休息」标记 —— 下一把武装时跳过（防 TG 风控）。
         ruleStateDao.updateState(rule.id, chatId, {
           armedDirection: null,
           // 模拟注同样占位：否则下一条开奖骰子找不到可结算对象（模拟会漏结算）
           pendingDirection: direction,
+          skipRound: isSpec ? 1 : undefined,
         });
 
-        candidates.push({ rule, direction, amount, actionId, actionText, isDry });
+        candidates.push({ rule, direction, amount, stake: totalStake, actionId, actionText, isDry });
       }
     });
 
@@ -318,8 +338,9 @@ class StrategyExecutorService {
     for (const c of candidates) {
       if (c.isDry) {
         // 模拟：占位时未置 pending，这里无需回滚，连败数不变
-        // 模拟钱包扣减本金（结算时按盈亏返还）——与实发同口径推演资金曲线
-        accountDao.deductSimBalance(botUserId, c.amount);
+        // 模拟钱包扣减本金（结算时按盈亏返还）——与实发同口径推演资金曲线；
+        // 定位胆按整组总投入扣（与 bet_amount 口径一致）
+        accountDao.deductSimBalance(botUserId, c.stake);
         operationLogDao.insert({
           bot_user_id: botUserId,
           action: 'BET_CREATED',
@@ -350,10 +371,13 @@ class StrategyExecutorService {
           `群=${maskChatId(chatId)}, 动作=${c.actionText}`
         );
       } else {
-        // 发送失败：回滚占位（pending → null），本轮放弃，等下一次连击重新触发
+        // 发送失败：回滚占位（pending → null），本轮放弃，等下一次连击重新触发。
+        // 注根本没投出去，不算「下过一把」——隔把休息标记一并撤销，
+        // 下一把正常下注（失败这意味着本轮没有出站消息，无风控压力）。
         transaction(() => ruleStateDao.updateState(c.rule.id, chatId, {
           armedDirection: null,
           pendingDirection: null,
+          skipRound: 0,
         }));
         operationLogDao.insert({
           bot_user_id: botUserId,
@@ -499,13 +523,42 @@ class StrategyExecutorService {
       }
     });
 
-    // 名单里有本账号的中奖行 → 把本期已结算赢单的估算盈利修正为精确值
-    if (settle.matched && settle.isWin && settle.profit != null && settle.period) {
-      const refined = actionLogDao.refineWinProfit(botUserId, chatId, settle.period, settle.profit);
+    // 名单里有本账号的行 → 把本期已结算赢单的估算盈利修正为精确值
+    // 2026-10-31（P1-2 修复）：定位胆按「逐数明细 × 注单号码组」精确归属，
+    // 大小按「大小行 × 方向」精确归属，不再把账号级聚合利润套到每条规则/每笔注单；
+    // 模拟模式下同步把钱包调到精确值（估算入账与精确值的差额）。
+    if (settle.matched && settle.period) {
+      const sizeLines = parseSettleSizeLines(text, botUserId);
+      const specLines = parseSettleSpecLines(text, botUserId);
+      const isSim = this._simOf(botUserId);
+      let refined = 0;
+      for (const w of actionLogDao.listSettledWinsByPeriod(botUserId, chatId, settle.period)) {
+        let precise = null;
+        if (specLines.length > 0 && String(w.direction).includes(',')) {
+          const nums = String(w.direction).split(',').map((s) => parseInt(s, 10));
+          precise = specLines
+            .filter((l) => nums.includes(l.number))
+            .reduce((s, l) => s + (l.win != null ? l.win : -(l.lose || 0)), 0);
+        } else if (sizeLines.length > 0
+          && (w.direction === 'BIG' || w.direction === 'SMALL')) {
+          const label = w.direction === 'BIG' ? '大' : '小';
+          precise = sizeLines
+            .filter((l) => l.label === label)
+            .reduce((s, l) => s + (l.win != null ? l.win : -(l.lose || 0)), 0);
+        }
+        if (precise == null) continue;
+        precise = Math.round(precise * 100) / 100;
+        if (actionLogDao.refineSpecLineProfit(w.id, precise) > 0) {
+          refined++;
+          if (isSim && w.profit != null) {
+            accountDao.creditSimBalance(botUserId, Math.round((precise - Number(w.profit)) * 100) / 100);
+          }
+        }
+      }
       if (refined > 0) {
         logger.info(
-          `[STRATEGY_EXEC] 盈利已按名单修正: 群=${maskChatId(chatId)}, 期=${settle.period}, ` +
-          `盈亏→${settle.profit}（${refined} 笔）`
+          `[STRATEGY_EXEC] 盈利已按名单逐行修正: 群=${maskChatId(chatId)}, 期=${settle.period}, ` +
+          `（${refined} 笔，定位胆${specLines.length}行/大小${sizeLines.length}行）`
         );
       }
     }
@@ -624,15 +677,26 @@ class StrategyExecutorService {
    * 仅用于实时路径（骰子/兜底/确认补结算）拿不到结算消息解析盈亏时的兜底，
    * 以及模拟模式的资金推演；真实盈亏以结算消息解析为准。
    */
-  _profitFor(chatId, direction, betAmount, isWin) {
+  _profitFor(chatId, direction, betAmount, isWin, perNoteOverride = null) {
     const parts = splitDirectionParts(direction);
     const a = Number(betAmount);
     if (parts.spec && !parts.big) {
-      return isWin
-        ? Math.round(a * (locationPayoutOdds() - NUMBERS_PER_BET) * 100) / 100
-        : Math.round(-a * NUMBERS_PER_BET * 100) / 100;
+      // 口径（2026-10-31 P0 修复）：bet_amount 存整组总投入（5A），
+      //   赢 = 单注 A × (5.8 − 5) = +0.8A（旧代码把 5A 当单注乘，多算 5 倍）
+      //   输 = −总投入 5A
+      // perNoteOverride：action_logs.stake_per_number（011 迁移后落库），
+      // 旧口径行（bet_amount 存单注 A）靠它纠正分母；无该列时按 5A 均分。
+      return calcSpecProfit(a, isWin, this._specOddsFor(chatId), perNoteOverride);
     }
     return isWin ? this._winProfit(chatId, a) : -a;
+  }
+  /**
+   * 定位胆含本金倍率：优先群级学习值（chat_odds.spec_odds），
+   * 无样本用全局 DICE_SPEC_PAYOUT（默认 5.8）
+   */
+  _specOddsFor(chatId) {
+    const learned = chatOddsDao.getSpecOdds(chatId);
+    return learned != null ? learned : locationPayoutOdds();
   }
 
   /**
@@ -1020,10 +1084,27 @@ class StrategyExecutorService {
       // （已有待发/挂起时跳过，避免开奖消息与结算消息重复触发）
       const nowState = ruleStateDao.ensure(rule.id, chatId);
       if (nowState.armed_direction || nowState.pending_direction) return false;
-      // 「最近出现的 5 个不同数」：回看最新历史去重取 5 个（不足用未出现数补齐）
-      direction = pickNumbers(messageLogDao.recentValues(chatId, 40).slice(1)).join(',');
+      // 隔一把歇一把（防 TG 风控）：上一把刚发过定位胆注 → 标记位为 1。
+      // 消费掉标记并整体跳过本把：不武装、不下注；本把结束后的下一把恢复。
+      // 只在 SPEC_FIVE 分支消费——大小玩法从不点亮该标记（防御性清零除外）。
+      if (Number(nowState.skip_round) === 1) {
+        ruleStateDao.consumeSkipRound(rule.id, chatId);
+        logger.info(
+          `[STRATEGY_EXEC] 定位胆隔把休息: 规则=${rule.id}, 群=${maskChatId(chatId)}` +
+          `（上一把刚下过注，本把跳过，下一把恢复自动下注）`
+        );
+        return false;
+      }
+      // 「最近出现的 5 个不同数」（2026-10-31 主人口径变更：含最新开奖）：
+      // recentValues 新→旧且含本期点数，直接去重取 5 个（不足用未出现数补齐）
+      direction = pickNumbers(messageLogDao.recentValues(chatId, 40)).join(',');
     } else {
       // CLASSIC（mode=0）：保持原口径——连击满足才武装，反向下注「大/小」
+      // 防御：mode=0 正常不会有隔把标记（仅 SPEC_FIVE 点亮），若有则静默清掉
+      const nowState = ruleStateDao.ensure(rule.id, chatId);
+      if (Number(nowState?.skip_round) === 1) {
+        ruleStateDao.consumeSkipRound(rule.id, chatId);
+      }
       const need = Math.max(2, rule.streak_count || 2);
       const recentValues = messageLogDao.recentValues(chatId, need + 1).slice(1);
       direction = evaluateStreak(rule, diceValue, recentValues);

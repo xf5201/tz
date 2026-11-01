@@ -309,7 +309,9 @@ class RuleHandler {
       base_bet: draft.base_bet,
       martingale_ratio: draft.martingale_ratio ?? 2.0,
       max_lose_streak: draft.max_lose_streak ?? 6,
-      stop_loss: Number(draft.mode) === 1 ? null : (draft.stop_loss ?? null),
+      // 2026-10-31：mode=1 同样允许配置止损（此前强制 null，止损分支形同虚设）；
+      // 累计投入按整组总投入口径（calcCumulativeStake 已按 5 倍计）
+      stop_loss: draft.stop_loss ?? null,
       min_interval: Number(draft.mode) === 1 ? 0 : (draft.min_interval ?? 3),
       mode: Number(draft.mode) === 1 ? 1 : 0,
       dry_run: 0,

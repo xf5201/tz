@@ -246,7 +246,7 @@ function parseWindowPeriod(text) {
  * 获胜行形如：　久遇 【8872785955】 大 300,赢 285 💰
  * → 赔率样本 = 285 / 300 = 0.95
  *
- * 只取「大/小」行（本系统只下大小）；组合（大单/大双…）、特码、单双
+ * 只取「大/小」行（本系统大小玩法只下大/小）；组合（大单/大双…）、特码、单双
  * 赔率不同，一律排除。样本用于按群动态维护赔率（chat_odds）。
  *
  * @param {string|null} text - 结算消息文本
@@ -273,6 +273,99 @@ function parseOddsSamples(text) {
 }
 
 /**
+ * 从结算消息名单提取 定位胆 的赔付样本（含本金倍率）
+ *
+ * 中奖行形如：　奔驰 迈巴赫 【7016374749】 定位胆6 200,赢 950 💰
+ * → 含本金倍率 = (950 + 200) / 200 = 5.75
+ *
+ * 实证样例（群方真实名单）：定位胆6 200,赢 950 ≈ 200×4.75 净利，
+ * 即群方口径赢金额 = 单注净利，返还 = 赢 + 本金。
+ *
+ * @param {string|null} text - 结算消息文本
+ * @returns {number[]} 含本金倍率样本列表（如 [5.75]）
+ */
+function parseSpecPayoutSamples(text) {
+  const raw = String(text || '');
+  if (!raw.includes('期输赢')) return [];
+
+  const samples = [];
+  for (const line of raw.split('\n')) {
+    const m = line.match(/【\d+】\s*定位胆\d+\s*([\d,]+(?:\.\d+)?)\s*,\s*赢\s*([\d,]+(?:\.\d+)?)/);
+    if (!m) continue;
+    const stake = parseFloat(m[1].replace(/,/g, ''));
+    const win = parseFloat(m[2].replace(/,/g, ''));
+    if (!(stake > 0) || !(win > 0)) continue;
+    const payout = (win + stake) / stake;
+    // 定位胆含本金倍率必然在 (1, 20] 区间（约 5.8），越界视为解析噪声
+    if (payout > 1 && payout <= 20) {
+      samples.push(Math.round(payout * 10000) / 10000);
+    }
+  }
+  return samples;
+}
+
+/**
+ * 解析结算消息中本账号的定位胆逐数明细（结构化，用于精确回填与对账）
+ *
+ * 本账号在结算名单里是「逐数分行」的：
+ *   定位胆1 2,赢 9    ← 中那注：赢 9 = 单注 2 × 4.5 净赔率（群方口径）
+ *   定位胆5 2,输 2    ← 未中数各一行：输 = 本金
+ * 同期可能有多行（本账号同一期在名单里出现多次时）。
+ *
+ * @param {string|null} text - 结算消息文本
+ * @param {string} userId - 登录账号的 TG 用户 ID
+ * @returns {Array<{number: number, stake: number, win: number|null, lose: number|null}>}
+ */
+function parseSettleSpecLines(text, userId) {
+  const raw = String(text || '');
+  if (!raw.includes('期输赢')) return [];
+  const lines = raw.split('\n').filter((line) => line.includes(`【${userId}】`));
+
+  const rows = [];
+  for (const line of lines) {
+    const m = line.match(/定位胆(\d+)\s*([\d,]+(?:\.\d+)?)\s*,\s*(赢|输)\s*([\d,]+(?:\.\d+)?)/);
+    if (!m) continue;
+    rows.push({
+      number: parseInt(m[1], 10),
+      stake: parseFloat(m[2].replace(/,/g, '')),
+      win: m[3] === '赢' ? parseFloat(m[4].replace(/,/g, '')) : null,
+      lose: m[3] === '输' ? parseFloat(m[4].replace(/,/g, '')) : null,
+    });
+  }
+  return rows;
+}
+
+/**
+ * 解析结算消息中本账号的大/小逐行明细（结构化，与 parseSettleSpecLines 对称）
+ *
+ * 本账号在名单里的行形如：
+ *   【8872785955】 大 300,赢 285 💰   ← 赢金额 = 净利（0.95 净赔率）
+ *   【8872785955】 小 100,输 100      ← 输金额 = 本金
+ *
+ * @param {string|null} text - 结算消息文本
+ * @param {string} userId - 登录账号的 TG 用户 ID
+ * @returns {Array<{label: '大'|'小', stake: number, win: number|null, lose: number|null}>}
+ */
+function parseSettleSizeLines(text, userId) {
+  const raw = String(text || '');
+  if (!raw.includes('期输赢')) return [];
+  const lines = raw.split('\n').filter((line) => line.includes(`【${userId}】`));
+
+  const rows = [];
+  for (const line of lines) {
+    const m = line.match(/【\d+】\s*(大|小)\s*([\d,]+(?:\.\d+)?)\s*,\s*(赢|输)\s*([\d,]+(?:\.\d+)?)/);
+    if (!m) continue;
+    rows.push({
+      label: m[1],
+      stake: parseFloat(m[2].replace(/,/g, '')),
+      win: m[3] === '赢' ? parseFloat(m[4].replace(/,/g, '')) : null,
+      lose: m[3] === '输' ? parseFloat(m[4].replace(/,/g, '')) : null,
+    });
+  }
+  return rows;
+}
+
+/**
  * 解析结算消息：期号 + 开奖点数 + 用登录账号的用户 ID 匹配本账号的输赢
  *
  * 获胜行形如：　奔驰 迈巴赫 【7016374749】 大 5,赢 4.75 💰
@@ -294,37 +387,49 @@ function parseSettle(text, userId) {
   const period = periodMatch ? periodMatch[1] : null;
   const diceMatch = raw.match(/骰子为[:：]\s*(\d+)/);
   const diceValue = diceMatch ? parseInt(diceMatch[1], 10) : null;
-
-  const meLine = raw
+  // 口径修正（2026-10-31）：本账号在结算名单里是「逐数分行」的——
+  //   定位胆1 2,赢 9   ← 中那注：赢 9 = 单注2 × (4.5净赔率)，即 返还2×5.8−2×5=9.6? 否：
+  //                        赢9 = 2×5.8−2×1.32... 按实测 9 ≈ 2×4.5（群方口径）
+  //   定位胆5 2,输 2   ← 未中数各一行：输 = 本金
+  //   样例还有「定位胆6 200,赢 950」= 200×4.75（赢行金额=该注净赢）
+  // 因此本账号本期真实盈亏 = 所有本账号行的 赢/输 金额代数和。
+  // 旧实现只抓第一行、且对「赢」错误地再扣 4 注本金（行口径已含未中注的输，
+  // 重复扣会导致赢单 +9 误记 +1）——已废弃。
+  const myLines = raw
     .split('\n')
-    .find((line) => line.includes(`【${userId}】`));
-
-  if (!meLine) {
+    .filter((line) => line.includes(`【${userId}】`));
+  if (myLines.length === 0) {
+    // 语义沿用旧版：名单里没有本账号 → matched:false，由调用方走骰子/赔率估算兜底
     return { period, diceValue, matched: false, isWin: null, profit: null };
   }
-
-  // 行内同时含「赢」与「输」时按出现位置判断
-  const winMatch = meLine.match(/赢\s*([\d.]+)/);
-  const loseMatch = meLine.match(/输\s*([\d.]+)/);
-  let isWin;
-  let profit = null;
-  if (winMatch && (!loseMatch || winMatch.index < loseMatch.index)) {
-    isWin = true;
-    profit = parseFloat(winMatch[1]);
-  } else if (loseMatch) {
-    isWin = false;
-    profit = -parseFloat(loseMatch[1]);
-  } else {
-    isWin = false;
+  let hasWinLine = false;
+  let hasLoseLine = false;
+  let total = 0;
+  for (const line of myLines) {
+    const winMatch = line.match(/赢\s*([\d,]+(?:\.\d+)?)/);
+    const loseMatch = line.match(/输\s*([\d.]+)/);
+    if (winMatch && (!loseMatch || winMatch.index < loseMatch.index)) {
+      hasWinLine = true;
+      total += parseFloat(winMatch[1].replace(/,/g, ''));
+    } else if (loseMatch) {
+      hasLoseLine = true;
+      total -= parseFloat(loseMatch[1]);
+    }
   }
-
-  return { period, diceValue, matched: true, isWin, profit: Number.isFinite(profit) ? profit : null };
+  const isWin = hasWinLine && !hasLoseLine ? true : hasWinLine || hasLoseLine ? hasWinLine : false;
+  return {
+    period, diceValue, matched: true, isWin,
+    profit: Math.round(total * 100) / 100,
+  };
 }
 
 module.exports = {
   parseDiceMessage,
   isSettleMessage,
   parseSettle,
+  parseSettleSpecLines,
+  parseSettleSizeLines,
+  parseSpecPayoutSamples,
   parseWindowPeriod,
   parseOddsSamples,
   isBalanceMessage,

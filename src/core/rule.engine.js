@@ -113,7 +113,8 @@ function calcAmount(base, ratio, losses) {
  * 否则止损阈值和实际投出去的钱对不上。
  */
 function calcCumulativeStake(base, ratio, losses, mode) {
-  // SPEC_FIVE（mode=1）一注 = 5 个数各一份，累计投入按 5 倍计（与实际扣款一致）
+  // SPEC_FIVE（mode=1）：bet_amount / 止损口径均为「整组总投入 = 单注 × 5」，
+  // calcAmount 产出的是单注金额，累计时逐项 ×5（与实际扣款一致）
   const multiple = Number(mode) === 1 ? NUMBERS_PER_BET : 1;
   const l = Number(losses) || 0;
   let total = 0;
@@ -150,12 +151,39 @@ function locationPayoutOdds() {
   return Number.isFinite(n) && n > 1 ? n : 5.8;
 }
 /**
- * 选号策略 v2（主人定：取「最近出现的 5 个不同数」，去重，按出现先后回看）
+ * 定位胆整组盈亏计算（纯函数，strategy-executor 与测试共用）
+ *
+ * 口径（2026-10-31 修复 P0-1）：
+ *   bet_amount / totalStake = 整组总投入 = 单注 A × NUMBERS_PER_BET(5)
+ *   赢（开奖号命中组内）= 返还 5.8A − 总投入 5A = +0.8A
+ *   输（5 注全黑）    = −总投入 5A
+ *
+ * @param {number} totalStake - 整组总投入（action_logs.bet_amount）
+ * @param {boolean} isWin
+ * @param {number} payoutOdds - 含本金赔付倍率（如 5.8）
+ * @param {number|null} [perNoteOverride] - 明确的单注金额（action_logs.stake_per_number，
+ *   011 迁移后落库）；旧口径行（bet_amount 存单注 A）靠它纠正分母，传 null 按 5A 均分
+ * @returns {number} 带符号盈亏（保留两位）
+ */
+function calcSpecProfit(totalStake, isWin, payoutOdds, perNoteOverride = null) {
+  const total = Number(totalStake) || 0;
+  const perNote = Number(perNoteOverride) > 0 ? Number(perNoteOverride) : total / NUMBERS_PER_BET;
+  if (isWin) {
+    if (!(perNote > 0)) return 0;
+    return Math.round(perNote * (Number(payoutOdds) - NUMBERS_PER_BET) * 100) / 100;
+  }
+  return -Math.round(total * 100) / 100;
+}
+/**
+ * 选号策略 v3（2026-10-31 主人定：取「最近出现的 5 个不同数」，**含最新开奖**）
  * 例：开奖序列（新→旧）3,4,5,3,1 → 从最新往回收集不同数：3,4,5,1 →
  *     继续回看直到凑满 5 个；若历史整体不足 5 个不同数，
  *     用 1–6 中尚未收集的数补齐（保证永远恰好 5 注）。
  *
- * @param {number[]} recentValues - 本群历史开奖点数（新→旧）
+ * 调用方注意：recentValues 需为「新→旧」且**包含本期开奖**（不预先 slice(1)）；
+ * 旧 v2 口径（不含最新）已废弃。
+ *
+ * @param {number[]} recentValues - 本群历史开奖点数（新→旧，含最新一条）
  * @returns {number[]} 恰好 5 个点数（升序输出，便于指令稳定）
  */
 function pickNumbers(recentValues) {
@@ -292,7 +320,7 @@ function splitDirectionParts(direction) {
  */
 function describeRule(rule) {
   if (Number(rule?.mode) === 1) {
-    return `每期开奖后自动下注 → 买「最近 5 个不同数」定位胆（赔率 5.8，每数一份额，独立规则）`;
+    return `每期开奖后自动下注 → 买「最近 5 个不同数」定位胆（含最新开奖；每数一份额，独立规则；隔一把歇一把防风控）`;
   }
   return `连续 ${rule.streak_count} 次开出「大」→ 买「小」；连续 ${rule.streak_count} 次开出「小」→ 买「大」`;
 }
@@ -304,12 +332,13 @@ module.exports = {
   calcCumulativeStake,
   buildBetText,
   describeRule,
-balanceFloor,
+  balanceFloor,
   minBaseBet,
   isBalanceInsufficient,
   // 定位胆策略
   NUMBERS_PER_BET,
   locationPayoutOdds,
+  calcSpecProfit,
   pickNumbers,
   buildBetTextForNumbers,
   directionLabel,

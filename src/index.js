@@ -276,11 +276,12 @@ async function main() {
 
   // ═══════════════════════════════════════════
   // 8. 数据保留定时清理（每小时）+ 挂起超时巡检（每分钟）
+  //    启动时先立即清一次，不等第一个整点
   // ═══════════════════════════════════════════
-  const cleanupTimer = setInterval(() => {
+  const runRetentionCleanup = () => {
     try {
-      const msgCutoff = beijingOffset(-config.messageRetentionDays);
-      const actCutoff = beijingOffset(-config.actionRetentionDays);
+      const msgCutoff = beijingOffsetHours(-config.messageRetentionHours);
+      const actCutoff = beijingOffsetHours(-config.actionRetentionHours);
       const removedMsg = messageLogDao.purgeBefore(msgCutoff);
       const removedAct = actionLogDao.purgeBefore(actCutoff);
       if (removedMsg || removedAct) {
@@ -289,7 +290,9 @@ async function main() {
     } catch (err) {
       logger.warn(`[BOOT] 数据清理失败: ${err.message}`);
     }
-  }, 3600 * 1000);
+  };
+  runRetentionCleanup();
+  const cleanupTimer = setInterval(runRetentionCleanup, 3600 * 1000);
   if (cleanupTimer.unref) cleanupTimer.unref();
 
   // 挂起超时巡检：结算消息丢失时解除卡死的挂起，避免「规则 × 群」永久停摆
@@ -369,6 +372,17 @@ function beijingOffset(days) {
   const shifted = new Date(Date.now() + 8 * 3600 * 1000 + days * 24 * 3600 * 1000);
   const pad = (n) => String(n).padStart(2, '0');
   return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} 00:00:00`;
+}
+/**
+ * 生成北京时间偏移量时间字符串（小时粒度，含时分秒，与 SQLite 存储格式对齐）
+ * @param {number} hours - 相对当前的偏移小时数（负数为过去）
+ * @returns {string} 'YYYY-MM-DD HH:mm:ss'
+ */
+function beijingOffsetHours(hours) {
+  const shifted = new Date(Date.now() + 8 * 3600 * 1000 + hours * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ` +
+    `${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}`;
 }
 
 // ── 启动 ──
