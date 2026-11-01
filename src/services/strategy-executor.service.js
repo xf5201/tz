@@ -58,14 +58,19 @@ const DEFAULT_PAYOUT_ODDS = 0.95;
 const DICE_HISTORY_SIZE = 6;
 
 // ═══════════════════════════════════════════
-// 定位胆「全局隔波」节拍（2026-11-02 主人口径）：
-//   v3.6.0 的按群隔把被多群交错抵消——每群各歇各的，账号层面永远有群在打。
-//   改为账号级：把时间切成 WAVE 周期（≈一局时长，默认 40s），
-//   奇数波全员开打、偶数波全局静默，账号出站呈现明显的「打一波、歇一波」。
-//   环境变量：DICE_SPEC_WAVE_ENABLED=0 关闭；DICE_SPEC_WAVE_PERIOD_MS 调周期。
+// 定位胆「全局隔波」节拍（2026-11-02 主人口径，v3.8.1 修订）：
+//   游戏一局 60 秒——开波必须短于 60s（每群一波最多打一次），
+//   静默必须长于 60s（保证每群的下一局完整落在静默里，不出现隔局连打）。
+//   默认：开 50s + 静默 70s，周期 120s → 出站呈「爆发一波 → 整局静默」。
+//   v3.8.0 的 40s/40s 与局钟不同步，相位漂移会漏过 静默期（实测 20:40/20:55 两波间隔仅 13s）。
+//   环境变量：DICE_SPEC_WAVE_ENABLED=0 关闭；DICE_SPEC_WAVE_OPEN_MS / DICE_SPEC_WAVE_PERIOD_MS 可调。
 // ═══════════════════════════════════════════
 const SPEC_WAVE_ENABLED = (process.env.DICE_SPEC_WAVE_ENABLED ?? '1') !== '0';
-const SPEC_WAVE_PERIOD_MS = Math.max(1000, Number(process.env.DICE_SPEC_WAVE_PERIOD_MS) || 40000);
+const SPEC_WAVE_PERIOD_MS = Math.max(60000, Number(process.env.DICE_SPEC_WAVE_PERIOD_MS) || 120000);
+const SPEC_WAVE_OPEN_MS = Math.min(
+  SPEC_WAVE_PERIOD_MS - 60000, // 静默至少 60s
+  Math.max(5000, Number(process.env.DICE_SPEC_WAVE_OPEN_MS) || 50000)
+);
 
 /**
  * 判断消息是否为下注窗口开盘信号（识别到底注：1u）
@@ -242,14 +247,20 @@ class StrategyExecutorService {
     const rules = ruleDao.listEnabledByUser(botUserId);
     if (rules.length === 0) return;
 
-    // ── 全局隔波：偶数波（静默波）不消费开盘信号 ──
-    // armed 保留到下一个开打波（3 分钟超时自愈永远不会触发，因为一个波只有 40s）
-    // 模拟/实发一致；规则禁用节拍时（DICE_SPEC_WAVE_ENABLED=0）恒为 true
+    // 记录本期期号（解析不到时为 null，后续结算按无期号兼容处理）
+    // —— 必须在静默波闸之前：期号记账是全账号共享的，静默波也要记，
+    //    否则静默期内的开盘窗口在 _chatRounds 里缺失，后续兜底结算的
+    //    「跨期保护」会把这些群的开奖统一当成「窗口内」，误放行
+    const period = parseWindowPeriod(text);
+    this._chatRounds.set(chatId, { period, atMs: Date.now() });
+
+    // ── 全局隔波（50s 开 + 70s 静默，v3.8.1）：不在开打窗口就跳过下注 ──
+    // armed 保留到下一波；结算/连败计数完全不受波闸影响
     if (SPEC_WAVE_ENABLED) {
-      const inWave = Math.floor(Date.now() / SPEC_WAVE_PERIOD_MS) % 2 === 1;
-      if (!inWave) {
+      const phase = Date.now() % SPEC_WAVE_PERIOD_MS;
+      if (phase >= SPEC_WAVE_OPEN_MS) {
         logger.info(
-          `[STRATEGY_EXEC] 全局静默波，跳过本期定位胆下注（下一波 40s 后恢复）: ` +
+          `[STRATEGY_EXEC] 全局静默波，跳过本期下注（开打窗口 50s/静默 70s）: ` +
           `群=${maskChatId(chatId)}`
         );
         return;
@@ -264,9 +275,7 @@ class StrategyExecutorService {
       return;
     }
 
-    // 记录本期期号（解析不到时为 null，后续结算按无期号兼容处理）
-    const period = parseWindowPeriod(text);
-    this._chatRounds.set(chatId, { period, atMs: Date.now() });
+    // （期号已在波闸前记录，这里直接进入候选构建）
 
     const candidates = [];
     const blockedChats = [];
