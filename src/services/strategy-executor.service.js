@@ -16,7 +16,7 @@ const {
   parseSettle, parseSettleSpecLines, parseSettleSizeLines, parseWindowPeriod,
 } = require('../core/dice.parser');
 const {
-  calcRoundProfit, isTakeProfitReached, isBaselineStale, beijingDate,
+  calcBalanceProfit, isTakeProfitReached, beijingDate,
 } = require('../core/profit.guard');
 const logger = require('../utils/logger');
 const { maskChatId } = require('../utils/mask.util');
@@ -536,12 +536,34 @@ class StrategyExecutorService {
         let precise = null;
         if (specLines.length > 0 && String(w.direction).includes(',')) {
           const nums = String(w.direction).split(',').map((s) => parseInt(s, 10));
+          // 名单口径（2026-11-02 实证修正）：名单里「赢 X」的 X 是**命中那一行**的净利，
+          //            它已经扣掉了本注内部的成本结构（净赔率 ≈ odds−5）。
+          //            但注单记录的整组投入 = 5 注，未中的 4 注成本（4×单注）名单不体现；
+          //            我们的资金真实变化 = 命中行返还 − 整组本金，
+          //            即 净利 = 命中行赢 + 命中行本金 − 整组投入 5A
+          //                = 行赢 − 4A（每笔命中按 5.75 倍率时 ≈ +0.75A）
+          // 用名单行 stake（本金口径）换算，避免 4A 按「实记盈利」循环定义。
+          const totalPaid = Number(w.bet_amount); // 整组总投入 5A（已扣）
+          const perNote = Number(w.stake_per_number) > 0
+            ? Number(w.stake_per_number)
+            : totalPaid / 5;
           precise = specLines
             .filter((l) => nums.includes(l.number))
-            .reduce((s, l) => s + (l.win != null ? l.win : -(l.lose || 0)), 0);
+            .reduce((s, l) => {
+              const rowNet = (l.win != null ? l.win : -(l.lose || 0));
+              // 中行：rowNet ≈ A×4.75 = 行返还 A×5.75 − 行本金 A（群方行口径）；
+              // 我们视角的净利 = 行返还(= rowNet + A) − 整组 5A = rowNet − 4A
+              // 未中行：rowNet = −A（名单「输 A」= 本金），与我们资金流一致直接累加
+              return s + (l.win != null ? rowNet - 4 * perNote : rowNet);
+            }, 0);
+          // 名单显示全部未中（与骰子判赢矛盾的极端场景）：信名单，整组全亏
+          if (!specLines.some((l) => nums.includes(l.number) && l.win != null)) {
+            precise = -totalPaid;
+          }
         } else if (sizeLines.length > 0
           && (w.direction === 'BIG' || w.direction === 'SMALL')) {
           const label = w.direction === 'BIG' ? '大' : '小';
+          // 大小行口径：赢 X = 净利（0.95 净赔率）——与我们的资金流一致，直接用
           precise = sizeLines
             .filter((l) => l.label === label)
             .reduce((s, l) => s + (l.win != null ? l.win : -(l.lose || 0)), 0);
@@ -1367,12 +1389,19 @@ class StrategyExecutorService {
   }
 
   /**
-   * 本轮盈利（用于止盈判定）= 今日总盈利 − 基准
-   * @param {object} account
-   * @returns {number}
+   * 本轮盈利（止盈判定用）＝ 当前余额 − 止盈基准（都是余额快照）
+   *
+   * 2026-11-02 改口径：不再用「今日注单累计 − 基准」。
+   * 余额是唯一真话：群方实际返还/扣款全部体现在余额里，
+   * 注单逐笔累计只是估算（名单口径误会过一次，见 2026-11-02 审计）。
+   *
+   * @param {object} account - accounts 行
+   * @returns {number|null} 余额未解析到时返回 null（无法判定）
    */
   getRoundProfit(account) {
-    return calcRoundProfit(this.getTodayProfit(account.bot_user_id), account.profit_baseline);
+    const cur = account.simulate === 1 ? account.sim_balance : account.balance;
+    if (cur == null || !Number.isFinite(Number(cur))) return null;
+    return calcBalanceProfit(cur, account.profit_baseline);
   }
 
   /**
@@ -1388,32 +1417,32 @@ class StrategyExecutorService {
     const account = accountDao.getActive(botUserId);
     if (!account) return false;
 
-    // 跨天 → 基准作废，本轮盈利重新从 0 起算，停止状态一并解除
-    if (isBaselineStale(account.profit_baseline_date)) {
-      accountDao.resetProfitBaseline(botUserId);
-      logger.info(`[STRATEGY_EXEC] 新的一天，止盈基准已重置: 用户=${botUserId}`);
-      return false;
-    }
-
     if (account.profit_stopped === 1) return false; // 已停，等手动恢复
     if (account.take_profit == null) return false;  // 未启用止盈
 
     const roundProfit = this.getRoundProfit(account);
+    // 余额未解析到 → 无法判定，不猜测（宁可不触发也不能拿旧数误停）
+    if (roundProfit == null) return false;
     if (!isTakeProfitReached(roundProfit, account.take_profit)) return false;
 
+    // 停止时快照当次余额进基准（面板与通知展示用；恢复时以新快照重算）
     accountDao.markProfitStopped(botUserId);
+    const cur = account.simulate === 1 ? account.sim_balance : account.balance;
+    if (cur != null) {
+      accountDao.snapshotProfitBaseline(botUserId, cur);
+    }
     // 待发不会被消费了，直接清掉（挂起保留：已投出去的注还要等结算）
     ruleStateDao.clearArmedByUser(botUserId);
-    const todayProfit = this.getTodayProfit(botUserId);
 
     operationLogDao.insert({
       bot_user_id: botUserId,
       action: 'TAKE_PROFIT_STOPPED',
-      detail: `本轮盈利 ${roundProfit} 已达止盈目标 ${account.take_profit}，停止运行（今日总盈利 ${todayProfit}）`,
+      detail: `余额口径盈利 ${roundProfit} 已达止盈目标 ${account.take_profit}` +
+        `（当前余额 ${cur} − 基准 ${account.profit_baseline ?? cur}），停止运行`,
     });
     logger.warn(
-      `[STRATEGY_EXEC] 止盈停止: 用户=${botUserId}, 本轮盈利=${roundProfit}, ` +
-      `目标=${account.take_profit}, 今日总盈利=${todayProfit}`
+      `[STRATEGY_EXEC] 止盈停止: 用户=${botUserId}, 余额口径盈利=${roundProfit}, ` +
+      `目标=${account.take_profit}, 当前余额=${cur}, 基准=${account.profit_baseline ?? cur}`
     );
 
     if (this.notification) {
@@ -1421,7 +1450,7 @@ class StrategyExecutorService {
         botUserId,
         `🎯 <b>已达标止盈，停止运行</b>\n` +
         `本轮盈利：${roundProfit}（目标 ${account.take_profit}）\n` +
-        `今日总盈利：${todayProfit}（保留，不受影响）\n\n` +
+        `口径：当前余额 ${cur} − 基准余额 ${account.profit_baseline ?? cur}\n\n` +
         `全部规则已停止下注。\n到主面板点「▶️ 恢复运行」才会继续（恢复后本轮盈利清零重新计算）。`
       ).catch(() => {});
       await this.notification.pushToUser(botUserId).catch(() => {});
@@ -1447,17 +1476,28 @@ class StrategyExecutorService {
   }
 
   async resumeFromTakeProfit(botUserId) {
-    const todayProfit = this.getTodayProfit(botUserId);
-    accountDao.resumeFromProfitStop(botUserId, todayProfit);
+    const account = accountDao.getActive(botUserId);
+    // 恢复运行 = 本轮盈利清零 → 把基准快照为「当前余额」
+    // （2026-11-02 余额口径：Profit baseline 现在存余额快照，不再是今日盈利累计）
+    accountDao.resumeFromProfitStop(botUserId);
+    if (account) {
+      const cur = account.simulate === 1 ? account.sim_balance : account.balance;
+      if (cur != null) {
+        accountDao.snapshotProfitBaseline(botUserId, cur);
+      } else {
+        // 余额未解析到：基准留空，等下一次余额刷新后再设置止盈才有意义
+        logger.warn(
+          `[STRATEGY_EXEC] 恢复运行但余额未解析，止盈基准暂空: 用户=${botUserId}`
+        );
+      }
+    }
 
     operationLogDao.insert({
       bot_user_id: botUserId,
       action: 'TAKE_PROFIT_RESUMED',
-      detail: `手动恢复运行，本轮盈利清零（基准设为今日总盈利 ${todayProfit}，今日总盈利不受影响）`,
+      detail: '手动恢复运行，本轮盈利清零（基准已快照为当前余额）',
     });
-    logger.info(
-      `[STRATEGY_EXEC] 止盈后手动恢复: 用户=${botUserId}, 基准=${todayProfit}`
-    );
+    logger.info(`[STRATEGY_EXEC] 止盈后手动恢复: 用户=${botUserId}（余额口径基准已重置）`);
     return 0;
   }
 

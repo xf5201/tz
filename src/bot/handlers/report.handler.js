@@ -3,6 +3,7 @@ const actionLogDao = require('../../db/action-log.dao');
 const accountDao = require('../../db/account.dao');
 const operationLogDao = require('../../db/operation-log.dao');
 const logger = require('../../utils/logger');
+const { calcBalanceProfit } = require('../../core/profit.guard');
 
 /**
  * 下注记录面板
@@ -63,19 +64,28 @@ class ReportHandler {
     const midnight = this._beijingMidnight();
     const todayProfit = round2(actionLogDao.sumProfit(botUserId, midnight));
 
-    // 本轮盈利（止盈判定用）：今日总盈利 − 基准
+    // 盈利（余额口径）：当前余额 − 初始余额（模拟模式用模拟钱包)；注单累计仅参考
+    let balanceProfit = null;
     let roundProfit = null;
     let takeProfit = null;
     if (services && services.strategyExecutor) {
       const account = accountDao.getActive(botUserId);
-      if (account && account.take_profit != null) {
-        takeProfit = account.take_profit;
-        roundProfit = services.strategyExecutor.getRoundProfit(account);
+      if (account) {
+        const isSim = account.simulate === 1;
+        const cur = isSim ? account.sim_balance : account.balance;
+        const base = isSim ? account.sim_initial_balance : account.initial_balance;
+        balanceProfit = calcBalanceProfit(cur, base);
+
+        if (account.take_profit != null) {
+          takeProfit = account.take_profit;
+          roundProfit = services.strategyExecutor.getRoundProfit(account);
+        }
       }
     }
 
     return {
       todayProfit,
+      balanceProfit,
       bets: actionLogDao.listByUser(botUserId, {
         limit: PAGE_SIZE,
         offset: page * PAGE_SIZE,

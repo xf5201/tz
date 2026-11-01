@@ -234,27 +234,46 @@ const accountDao = {
   /**
    * 设置今日止盈目标（本轮盈利达到即停止；传 null 关闭）
    *
-   * 首次设置时把「当时的今日盈利」记为基准，本轮盈利从 0 开始算。
+   * 2026-11-02 口径：基准改为「余额快照」——设置时以当前余额为起点，
+   * 本轮盈利 = 当前余额 − 基准（不再用今日盈利累计充当基准）。
    *
    * @param {string} botUserId
    * @param {number|null} target - 止盈目标金额；null = 不启用
-   * @param {number} baseline - 当前的今日盈利（作为本轮起点）
+   * @param {number|null} baseline - 当前的余额快照（本轮起点）
    */
-  setTakeProfit(botUserId, target, baseline = 0) {
+  setTakeProfit(botUserId, target, baseline = null) {
     const db = getConnection();
     db.prepare(`
       UPDATE accounts
       SET take_profit = ?,
-          profit_baseline = COALESCE(profit_baseline, ?),
-          profit_baseline_date = COALESCE(profit_baseline_date, ?),
+          profit_baseline = ?,
+          profit_baseline_date = ?,
           updated_at = datetime('now', '+8 hours')
       WHERE bot_user_id = ?
     `).run(
       target ?? null,
-      baseline,
+      baseline != null ? Number(baseline) : null,
       beijingDate(),
       String(botUserId)
     );
+  },
+
+  /**
+   * 基准余额快照（把当前余额记为本轮盈利的起点）
+   *
+   * 用于：设置止盈、恢复运行、跨天重置、旧口径数据自动迁移。
+   *
+   * @param {string} botUserId
+   * @param {number} balance - 当前余额（真实或模拟钱包）
+   */
+  snapshotProfitBaseline(botUserId, balance) {
+    const db = getConnection();
+    db.prepare(`
+      UPDATE accounts
+      SET profit_baseline = ?, profit_baseline_date = ?,
+          updated_at = datetime('now', '+8 hours')
+      WHERE bot_user_id = ?
+    `).run(Number(balance), beijingDate(), String(botUserId));
   },
 
   /**
@@ -274,27 +293,25 @@ const accountDao = {
   /**
    * 恢复运行（达到止盈后由用户手动触发）
    *
-   * 关键：只把「本轮盈利」清零（基准拉到当前今日盈利），
-   * 今日总盈利本身是一条条下注记录算出来的，完全不受影响。
-   *
-   * @param {string} botUserId
-   * @param {number} baseline - 当前的今日盈利（作为新的本轮起点）
+   * 2026-11-02 余额口径：基准为「余额快照」，由调用方随后快照当前余额。
    */
-  resumeFromProfitStop(botUserId, baseline = 0) {
+  resumeFromProfitStop(botUserId) {
     const db = getConnection();
     db.prepare(`
       UPDATE accounts
       SET profit_stopped = 0,
           profit_stopped_at = NULL,
-          profit_baseline = ?,
-          profit_baseline_date = ?,
           updated_at = datetime('now', '+8 hours')
       WHERE bot_user_id = ?
-    `).run(baseline, beijingDate(), String(botUserId));
+    `).run(String(botUserId));
   },
 
   /**
    * 跨天重置基准（新的一天，本轮盈利重新从 0 起算）
+   *
+   * 2026-11-02 余额口径：旧实现把基准归 0 —— 那是「盈利累计」口径的残留，
+   * 余额口径下 0 基准会把当前全部余额当成盈利。改为清空基准（NULL），
+   * 下次结算检查时重新快照当前余额。
    *
    * @param {string} botUserId
    */
@@ -302,7 +319,7 @@ const accountDao = {
     const db = getConnection();
     db.prepare(`
       UPDATE accounts
-      SET profit_baseline = 0,
+      SET profit_baseline = NULL,
           profit_baseline_date = ?,
           profit_stopped = 0,
           profit_stopped_at = NULL,
