@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS rules (
     max_lose_streak    INTEGER NOT NULL DEFAULT 6,
     stop_loss          REAL NULL,
     min_interval       INTEGER NOT NULL DEFAULT 3,
-    -- 玩法模式：0=CLASSIC 大小反打（原玩法） 1=SPEC_FIVE 大小+伴随5数定位胆
+    -- 玩法模式：0=CLASSIC 大小反打  1=SPEC_FIVE 独立五数定位胆（不下大小）
     mode               INTEGER NOT NULL DEFAULT 0 CHECK(mode IN (0,1)),
     dry_run            INTEGER NOT NULL DEFAULT 0
                        CHECK(dry_run IN (0,1)),
@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS rule_chat_state (
     blocked_at         DATETIME NULL,
     -- 停注后是否已经出现过一次「连击中断」，用于下一次触发时自动恢复
     streak_broken      INTEGER NOT NULL DEFAULT 0 CHECK(streak_broken IN (0,1)),
+    -- 隔期下注（防 TG 风控）：1 = 上一把刚下过注（限 SPEC_FIVE 定位胆），
+    -- 紧接着的一把跳过武装/下注，第二轮触发时自动清零恢复
+    skip_round         INTEGER NOT NULL DEFAULT 0 CHECK(skip_round IN (0,1)),
     created_at         DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     updated_at         DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours')),
     FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE CASCADE,
@@ -168,6 +171,8 @@ CREATE TABLE IF NOT EXISTS action_logs (
     chat_id     TEXT NOT NULL,
     direction   TEXT NOT NULL,
     bet_amount  INTEGER NOT NULL,
+    -- 定位胆单注金额（整组总投入 = bet_amount = 单注 × 5）；大小玩法为 NULL
+    stake_per_number REAL NULL,
     action_text TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'CREATED'
                 CHECK(status IN ('CREATED','SENT','FAILED','DRY_RUN')),
@@ -191,13 +196,17 @@ CREATE INDEX IF NOT EXISTS idx_action_logs_bet_msg ON action_logs(chat_id, bet_m
 CREATE INDEX IF NOT EXISTS idx_action_logs_chat_period ON action_logs(chat_id, round_period);
 
 -- ═══════════════════════════════════════════
--- chat_odds（按群动态学习的大/小赔率）
--- 来源：结算名单中奖行 赢金额÷投注额（增量平均，抑制单条噪声）
+-- chat_odds（按群动态学习的大/小赔率 + 定位胆含本金倍率）
+-- 来源1：结算名单中奖行 赢金额÷投注额（增量平均，抑制单条噪声）→ odds
+-- 来源2：结算名单定位胆行 (赢+投)÷投（增量平均）→ spec_odds（无样本用全局 5.8 兜底）
 -- ═══════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS chat_odds (
     chat_id      TEXT PRIMARY KEY,
     odds         REAL NOT NULL,
     sample_count INTEGER NOT NULL DEFAULT 0,
+    -- 群级定位胆含本金倍率（如 5.8）；NULL = 尚未学到样本
+    spec_odds    REAL NULL,
+    spec_sample_count INTEGER NOT NULL DEFAULT 0,
     updated_at   DATETIME NOT NULL DEFAULT (datetime('now', '+8 hours'))
 );
 

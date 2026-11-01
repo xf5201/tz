@@ -25,10 +25,10 @@ const ruleStateDao = {
   },
 
   /**
-   * 更新状态（连败数 / 待发方向 / 挂起方向，传 undefined 表示保持不变）
+   * 更新状态（连败数 / 待发方向 / 挂起方向 / 隔期休息标记，传 undefined 表示保持不变）
    */
   updateState(ruleId, chatId, {
-    consecutiveLosses, armedDirection, pendingDirection, streakBroken,
+    consecutiveLosses, armedDirection, pendingDirection, streakBroken, skipRound,
   } = {}) {
     const db = getConnection();
     const sets = [];
@@ -49,12 +49,36 @@ const ruleStateDao = {
       sets.push('streak_broken = ?');
       values.push(streakBroken ? 1 : 0);
     }
+    if (skipRound !== undefined) {
+      sets.push('skip_round = ?');
+      values.push(skipRound ? 1 : 0);
+    }
     if (!sets.length) return;
     sets.push("updated_at = datetime('now', '+8 hours')");
     values.push(ruleId, String(chatId));
     db.prepare(`
       UPDATE rule_chat_state SET ${sets.join(', ')} WHERE rule_id = ? AND chat_id = ?
     `).run(...values);
+  },
+
+  /**
+   * 读「隔期休息」标记并清零（原子操作，需在事务内调用）
+   *
+   * 返回清除前的值：1 = 本把应休息（上一把刚下过注，防 TG 风控）。
+   * 只在 SPEC_FIVE 定位胆流程中调用；大小玩法从不点亮该标记。
+   *
+   * @param {number} ruleId
+   * @param {string} chatId
+   * @returns {boolean} 清除前是否为 1
+   */
+  consumeSkipRound(ruleId, chatId) {
+    const db = getConnection();
+    const info = db.prepare(`
+      UPDATE rule_chat_state
+      SET skip_round = 0, updated_at = datetime('now', '+8 hours')
+      WHERE rule_id = ? AND chat_id = ? AND skip_round = 1
+    `).run(ruleId, String(chatId));
+    return info.changes > 0;
   },
 
   /**
@@ -78,6 +102,7 @@ const ruleStateDao = {
           armed_direction = NULL,
           pending_direction = NULL,
           streak_broken = 0,
+          skip_round = 0,
           updated_at = datetime('now', '+8 hours')
       WHERE rule_id = ? AND chat_id = ?
     `).run(String(reason || '').slice(0, 200), ruleId, String(chatId));
@@ -102,6 +127,7 @@ const ruleStateDao = {
           consecutive_losses = 0,
           streak_broken = 0,
           armed_direction = NULL,
+          skip_round = 0,
           updated_at = datetime('now', '+8 hours')
       WHERE rule_id = ? AND chat_id = ? AND blocked = 1
     `).run(ruleId, String(chatId));
@@ -160,6 +186,7 @@ const ruleStateDao = {
           consecutive_losses = 0,
           streak_broken = 0,
           armed_direction = NULL,
+          skip_round = 0,
           updated_at = datetime('now', '+8 hours')
       WHERE blocked = 1 AND rule_id IN (
         SELECT id FROM rules WHERE bot_user_id = ?
@@ -204,6 +231,7 @@ const ruleStateDao = {
       UPDATE rule_chat_state
       SET consecutive_losses = 0, armed_direction = NULL, pending_direction = NULL,
           blocked = 0, blocked_reason = NULL, blocked_at = NULL, streak_broken = 0,
+          skip_round = 0,
           updated_at = datetime('now', '+8 hours')
       WHERE rule_id = ?
     `).run(ruleId);
@@ -265,6 +293,16 @@ const ruleStateDao = {
    * @param {number} ttlSeconds - 挂起最长保留时间（秒）
    * @returns {Array} 含 bot_user_id / rule_name / last_unsettled_at
    */
+  /**
+   * 清空某群全部规则运行状态（被踢/失联群自动清理时调用）
+   * @param {string} chatId
+   * @returns {number} 删除行数
+   */
+  purgeByChat(chatId) {
+    const db = getConnection();
+    const r = db.prepare('DELETE FROM rule_chat_state WHERE chat_id = ?').run(String(chatId));
+    return r.changes;
+  },
   listStalePending(ttlSeconds) {
     const db = getConnection();
     return db.prepare(`

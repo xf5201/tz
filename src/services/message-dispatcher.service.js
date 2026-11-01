@@ -9,7 +9,7 @@ const { maskChatId } = require('../utils/mask.util');
 const {
   parseDiceMessage, isSettleMessage, parseBalance, parseBetResult,
   isBalanceQueryReply, parseBalanceQuery, getReplyToMsgId, isBalanceForNickname,
-  parseOddsSamples,
+  parseOddsSamples, parseSpecPayoutSamples,
 } = require('../core/dice.parser');
 const { isBetWindowMessage } = require('./strategy-executor.service');
 const { get: getConfigValue } = require('../utils/config.loader');
@@ -112,7 +112,10 @@ class MessageDispatcherService {
       sender_id: message.senderId ? message.senderId.toString() : null,
       msg_type: kind,
       value,
-      raw_text: typeof message.message === 'string' ? message.message : '',
+      // 入库瘦身：群聊原文（结算名单等）全文不落库，只留「期号+开奖」摘要。
+      // 全项目无任何代码回读 raw_text；策略取号只用 value 列，
+      // 结算/下注判定全部走内存里的原始 message，不受影响。
+      raw_text: summarizeForLog(kind, value, message),
     });
     if (!isNew) return;
 
@@ -136,6 +139,15 @@ class MessageDispatcherService {
           chatOddsDao.recordSamples(chatId, samples);
         } catch (err) {
           logger.warn(`[DISPATCH] 赔率样本写入失败: 群=${maskChatId(chatId)}, ${err.message}`);
+        }
+      }
+      // 定位胆含本金倍率同样按群学习（chat_odds.spec_odds）
+      const specSamples = parseSpecPayoutSamples(message.message);
+      if (specSamples.length > 0) {
+        try {
+          chatOddsDao.recordSpecSamples(chatId, specSamples);
+        } catch (err) {
+          logger.warn(`[DISPATCH] 定位胆倍率样本写入失败: 群=${maskChatId(chatId)}, ${err.message}`);
         }
       }
       for (const userId of targets) {
@@ -290,8 +302,42 @@ class MessageDispatcherService {
       nickname = null;
     }
     if (nickname && !String(message.message || '').includes(nickname)) return null;
-
     return { owner, bet };
+  }
+}
+
+/**
+ * 入库摘要：群聊消息不存全文，只保留期号 / 开奖点数等关键信息。
+ * 现状（2026-10-31）：message_logs.raw_text 全项目零回读，
+ * 但结算名单等原文一条几百字，是库里最大的死重。此函数把它们
+ * 压成一行，例如：
+ *   dice   → "骰子:3"
+ *   settle → "第577期 骰子:4"
+ *   window → "期号:9d3e2c1f..."
+ * 其余类型截前 60 字符兜底。
+ * @param {string} kind - 消息类型
+ * @param {number|null} value - 开奖点数（dice 类型才有）
+ * @param {object} message - GramJS Message
+ * @returns {string} 摘要文本
+ */
+function summarizeForLog(kind, value, message) {
+  const raw = message && typeof message.message === 'string' ? message.message : '';
+  if (!raw) return '';
+  try {
+    if (kind === 'dice') return `骰子:${value != null ? value : ''}`;
+    // 结算名单：第xxx期输赢 + 骰子为：N
+    let m = raw.match(/第\s*([A-Za-z0-9]+)\s*期输赢/);
+    if (m) {
+      const dv = raw.match(/骰子为[:：]\s*(\d+)/);
+      return `第${m[1]}期${dv ? ` 骰子:${dv[1]}` : ''}`;
+    }
+    // 开盘/下注播报：期号: xxx
+    m = raw.match(/期号[:：]\s*([A-Za-z0-9]+)/);
+    if (m) return `期号:${m[1]}`;
+    // 兜底：其余类型截前 60 字符
+    return raw.slice(0, 60);
+  } catch (e) {
+    return raw.slice(0, 60);
   }
 }
 

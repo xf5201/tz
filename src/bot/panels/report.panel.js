@@ -47,6 +47,12 @@ class ReportPanel {
       // 时间去掉日期只留 时:分:秒
       const time = (b.created_at || '').split(' ')[1] || b.created_at;
       const dir = require('../../core/rule.engine').directionLabel(b.direction);
+      // 金额展示（2026-10-31）：定位胆显示「每注X×5总Y」，大小显示原金额，
+      // 避免「定位胆1/2/3/4/5 50」被误读为每个号下 50
+      const isSpecRow = !(b.direction === 'BIG' || b.direction === 'SMALL');
+      const amountText = isSpecRow
+        ? `每注${b.stake_per_number != null ? b.stake_per_number : Math.round(Number(b.bet_amount) / 5)}×5总${b.bet_amount}`
+        : String(b.bet_amount);
       let result;
       if (b.status === 'DRY_RUN') {
         // 模拟注：按开奖点数判定，无盈亏金额
@@ -68,7 +74,7 @@ class ReportPanel {
 
       // 群名只取前 3 个字（一行要塞时间/方向/金额/输赢，位置有限）
       const chat = shortTitle(b.chat_title) || maskChatId(b.chat_id);
-      text += `${time}　${escapeHtml(chat)}｜${escapeHtml(dir)} ${escapeHtml(String(b.bet_amount))}　${result}\n`;
+      text += `${time}　${escapeHtml(chat)}｜${escapeHtml(dir)} ${escapeHtml(amountText)}　${result}\n`;
     }
 
     return text;

@@ -15,14 +15,15 @@ const actionLogDao = {
   insert(data) {
     const db = getConnection();
     const info = db.prepare(`
-      INSERT INTO action_logs (bot_user_id, rule_id, chat_id, direction, bet_amount, action_text, status, round_period)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO action_logs (bot_user_id, rule_id, chat_id, direction, bet_amount, stake_per_number, action_text, status, round_period)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       String(data.bot_user_id),
       data.rule_id ?? null,
       String(data.chat_id),
       data.direction,
       data.bet_amount,
+      data.stake_per_number ?? null,
       data.action_text,
       data.status || 'CREATED',
       data.round_period ?? null
@@ -257,25 +258,73 @@ const actionLogDao = {
   },
 
   /**
+   * 取某群某期已结算的赢单（名单逐行精确回填用）
+   * @param {string} botUserId
+   * @param {string} chatId
+   * @param {string} period - 期号
+   * @returns {Array} 含 id / direction / profit
+   */
+  listSettledWinsByPeriod(botUserId, chatId, period) {
+    const db = getConnection();
+    return db.prepare(`
+      SELECT id, rule_id, direction, bet_amount, stake_per_number, profit
+      FROM action_logs
+      WHERE bot_user_id = ? AND chat_id = ? AND round_period = ?
+        AND is_win = 1 AND settled_at IS NOT NULL
+      ORDER BY id
+    `).all(String(botUserId), String(chatId), String(period));
+  },
+
+  /**
    * 用结算名单里的精确盈亏修正已结算注单的盈利（同群同期号的赢单）
    *
    * 常规结算用「点数 × 群赔率」估算盈利；结算名单里若出现本账号的中奖行，
    * 金额是游戏方给出的精确值，用它覆盖估算值（仅修正赢单，输单=本金无需修正）。
    *
+   * 2026-10-31 修复（P1-2）：新增 rule_id 维度。同一账号同群同期若有多条规则，
+   * 各规则的注单只按各自（rule_id, period）聚合利润修正，不再把账号级总额
+   * 套到每一条规则上（避免重复计利）。
+   *
    * @param {string} botUserId
    * @param {string} chatId
+   * @param {number|null} ruleId - 规则 ID（null 时退回旧行为：修该群该期全部赢单）
    * @param {string} period - 结算期号
    * @param {number} profit - 名单中解析出的净盈利
    * @returns {number} 实际修正的行数
    */
-  refineWinProfit(botUserId, chatId, period, profit) {
+  refineWinProfit(botUserId, chatId, ruleId, period, profit) {
+    const db = getConnection();
+    const where = ruleId != null
+      ? 'bot_user_id = ? AND chat_id = ? AND rule_id = ? AND round_period = ?'
+      : 'bot_user_id = ? AND chat_id = ? AND round_period = ?';
+    const params = ruleId != null
+      ? [Number(profit), String(botUserId), String(chatId), ruleId, String(period), Number(profit)]
+      : [Number(profit), String(botUserId), String(chatId), String(period), Number(profit)];
+    return db.prepare(`
+      UPDATE action_logs
+      SET profit = ?
+      WHERE ${where}
+        AND is_win = 1 AND settled_at IS NOT NULL AND profit != ?
+    `).run(...params).changes;
+  },
+
+  /**
+   * 用结算名单里本账号的逐数明细精确回填单笔定位胆注单
+   *
+   * 名单行口径（群方实证）：赢金额 = 该注净利（如 定位胆6 200,赢 950 = 200×4.75），
+   * 输金额 = 该注本金。回填值 = Σ(赢行净利) − Σ(输行本金)。
+   *
+   * @param {number} id - action_logs.id
+   * @param {number} specProfit - 逐数明细代数和（净盈亏）
+   * @returns {number} 实际更新的行数
+   */
+  refineSpecLineProfit(id, specProfit) {
     const db = getConnection();
     return db.prepare(`
       UPDATE action_logs
       SET profit = ?
-      WHERE bot_user_id = ? AND chat_id = ? AND round_period = ?
-        AND is_win = 1 AND settled_at IS NOT NULL AND profit != ?
-    `).run(Number(profit), String(botUserId), String(chatId), String(period), Number(profit)).changes;
+      WHERE id = ? AND is_win = 1 AND settled_at IS NOT NULL
+    `).run(Number(specProfit), id).changes;
   },
 
   /**

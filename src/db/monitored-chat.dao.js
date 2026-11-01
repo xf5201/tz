@@ -85,6 +85,15 @@ const monitoredChatDao = {
     const db = getConnection();
     db.prepare('DELETE FROM monitored_chats WHERE bot_user_id = ?').run(String(botUserId));
   },
+  /**
+   * 按群移除全部账号的监听（被踢/退群/失联时的自动清理）
+   * @param {string} chatId
+   * @returns {number} 删除行数
+   */
+  removeByChat(chatId) {
+    const db = getConnection();
+    const r = db.prepare('DELETE FROM monitored_chats WHERE chat_id = ?').run(String(chatId));
+    return r.changes;
+  },
 };
-
 module.exports = monitoredChatDao;

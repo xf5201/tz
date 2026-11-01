@@ -86,7 +86,7 @@ class RulePanel {
     text += '━━━━━━━━━━━━━━━━━━━━\n';
     text += `🎲 模式：${mode1 ? '🎯 五数定位胆（独立规则）' : '🔄 大小反买'}\n`;
     if (mode1) {
-      text += '💡 触发：每期开奖后自动下注——取「最近出现的 5 个不同数」\n';
+      text += '💡 触发：每期开奖后自动下注——取「最近出现的 5 个不同数」（含最新开奖）\n';
       text += '💡 　　　每个数各下一注「定位胆N 金额」（5 行合一条消息）\n';
       text += '💡 　　　无需设置连续次数\n';
     } else {
@@ -96,10 +96,12 @@ class RulePanel {
     }
     text += `👥 作用范围：全部已勾选的监听群\n`;
     text += '━━━━━━━━━━━━━━━━━━━━\n';
-text += `💰 初始下注：${draft.base_bet ?? '⬜'}\n`;
+text += `💰 初始下注：${draft.base_bet ?? '⬜'}（${mode1 ? `每个数各 ${draft.base_bet ?? '?'}，总投入 ${draft.base_bet != null ? draft.base_bet * 5 : '?'} ` : ''}）\n`;
     text += `📈 倍投：${draft.martingale_ratio ? `${draft.martingale_ratio}x` : '⬜'}\n`;
     text += `🛑 连败停止：${draft.max_lose_streak ?? '⬜'}\n`;
-    if (!mode1) {
+    if (mode1) {
+      text += `⚖️ 止损上限：${draft.stop_loss != null ? draft.stop_loss : '不限'}（按总投入计）\n`;
+    } else {
       text += `⚖️ 止损上限：${draft.stop_loss != null ? draft.stop_loss : '不限'}\n`;
       text += `⏱ 最小间隔：${draft.min_interval ?? 3}s\n`;
     }
@@ -112,13 +114,11 @@ text += `💰 初始下注：${draft.base_bet ?? '⬜'}\n`;
       [Markup.button.callback(`🔢 连续次数：${draft.streak_count ?? '?'}`, 'rule:w_streak')],
       [Markup.button.callback(`💰 金额：${draft.base_bet ?? '?'}`, 'rule:w_base')],
       [Markup.button.callback(`📈 倍投：${draft.martingale_ratio ? draft.martingale_ratio + 'x' : '?'}`, 'rule:w_ratio')],
-      mode1
-        ? [Markup.button.callback(`🛑 连败停止：${draft.max_lose_streak ?? '?'}`, 'rule:w_maxlose')]
-        : [
-            Markup.button.callback('🛑 连败：' + (draft.max_lose_streak ?? '?'), 'rule:w_maxlose'),
-            Markup.button.callback(`⚖️ 止损：${draft.stop_loss != null ? draft.stop_loss : '不限'}`, 'rule:w_stop'),
-            Markup.button.callback(`⏱ 间隔：${draft.min_interval ?? 3}s`, 'rule:w_minint'),
-          ],
+      [
+        Markup.button.callback('🛑 连败：' + (draft.max_lose_streak ?? '?'), 'rule:w_maxlose'),
+        Markup.button.callback(`⚖️ 止损：${draft.stop_loss != null ? draft.stop_loss : '不限'}`, 'rule:w_stop'),
+        ...(mode1 ? [] : [Markup.button.callback(`⏱ 间隔：${draft.min_interval ?? 3}s`, 'rule:w_minint')]),
+      ],
     ];
 
     if (isEdit) {
