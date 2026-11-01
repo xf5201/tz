@@ -57,6 +57,16 @@ const DEFAULT_PAYOUT_ODDS = 0.95;
 // 每群在内存里保留的最近骰子条数（发送在途补结算 / 开盘兜底结算用）
 const DICE_HISTORY_SIZE = 6;
 
+// ═══════════════════════════════════════════
+// 定位胆「全局隔波」节拍（2026-11-02 主人口径）：
+//   v3.6.0 的按群隔把被多群交错抵消——每群各歇各的，账号层面永远有群在打。
+//   改为账号级：把时间切成 WAVE 周期（≈一局时长，默认 40s），
+//   奇数波全员开打、偶数波全局静默，账号出站呈现明显的「打一波、歇一波」。
+//   环境变量：DICE_SPEC_WAVE_ENABLED=0 关闭；DICE_SPEC_WAVE_PERIOD_MS 调周期。
+// ═══════════════════════════════════════════
+const SPEC_WAVE_ENABLED = (process.env.DICE_SPEC_WAVE_ENABLED ?? '1') !== '0';
+const SPEC_WAVE_PERIOD_MS = Math.max(1000, Number(process.env.DICE_SPEC_WAVE_PERIOD_MS) || 40000);
+
 /**
  * 判断消息是否为下注窗口开盘信号（识别到底注：1u）
  * @param {string|null} text - 消息文本
@@ -232,6 +242,20 @@ class StrategyExecutorService {
     const rules = ruleDao.listEnabledByUser(botUserId);
     if (rules.length === 0) return;
 
+    // ── 全局隔波：偶数波（静默波）不消费开盘信号 ──
+    // armed 保留到下一个开打波（3 分钟超时自愈永远不会触发，因为一个波只有 40s）
+    // 模拟/实发一致；规则禁用节拍时（DICE_SPEC_WAVE_ENABLED=0）恒为 true
+    if (SPEC_WAVE_ENABLED) {
+      const inWave = Math.floor(Date.now() / SPEC_WAVE_PERIOD_MS) % 2 === 1;
+      if (!inWave) {
+        logger.info(
+          `[STRATEGY_EXEC] 全局静默波，跳过本期定位胆下注（下一波 40s 后恢复）: ` +
+          `群=${maskChatId(chatId)}`
+        );
+        return;
+      }
+    }
+
     // 余额见底 → 全局停注（不再下任何一注）
     if (this.isBalanceDepleted(account, rules)) {
       logger.info(
@@ -288,18 +312,6 @@ class StrategyExecutorService {
         // bet_amount 存整组总投入（5×amount，2026-10-31 口径修正），实发单注金额仍是 amount
         const dirParts = splitDirectionParts(direction);
         const isSpec = dirParts.spec && !dirParts.big;
-
-        // 防御性兜底：跳把标记在 _tryArm 已消费，正常不会武装成功后仍带着标记。
-        // 万一带着（进程中途改配置等），这里最后一道闸挡住：本把不下注、清标记。
-        if (isSpec && Number(state.skip_round) === 1) {
-          ruleStateDao.consumeSkipRound(rule.id, chatId);
-          logger.warn(
-            `[STRATEGY_EXEC] 定位胆武装带隔把标记（异常），已跳过本轮并清除: ` +
-            `规则=${rule.id}, 群=${maskChatId(chatId)}`
-          );
-          continue;
-        }
-
         const actionText = isSpec
           ? buildBetTextForNumbers(dirParts.spec.split(','), amount)
           : buildBetText(direction, amount);
@@ -322,12 +334,11 @@ class StrategyExecutorService {
         // 必须在这里占位，不能等发送成功再置 —— 否则发送耗时期间（最长 30s）
         // 若同一条开盘消息被 NewMessage 与轮询兜底重复投递，会再建一条下注＝重复下注。
         // 发送失败时再在下方回滚 pending（本轮放弃），不会卡死。
-        // 同时：定位胆下注的这一把点亮「隔把休息」标记 —— 下一把武装时跳过（防 TG 风控）。
+        // 2026-11-02 v3.8.0：节拍由「全局隔波」统一控制，按群 skip_round 标记废弃不用。
         ruleStateDao.updateState(rule.id, chatId, {
           armedDirection: null,
           // 模拟注同样占位：否则下一条开奖骰子找不到可结算对象（模拟会漏结算）
           pendingDirection: direction,
-          skipRound: isSpec ? 1 : undefined,
         });
 
         candidates.push({ rule, direction, amount, stake: totalStake, actionId, actionText, isDry });
@@ -371,13 +382,10 @@ class StrategyExecutorService {
           `群=${maskChatId(chatId)}, 动作=${c.actionText}`
         );
       } else {
-        // 发送失败：回滚占位（pending → null），本轮放弃，等下一次连击重新触发。
-        // 注根本没投出去，不算「下过一把」——隔把休息标记一并撤销，
-        // 下一把正常下注（失败这意味着本轮没有出站消息，无风控压力）。
+        // 发送失败：回滚占位（pending → null），本轮放弃，等下一次连击重新触发
         transaction(() => ruleStateDao.updateState(c.rule.id, chatId, {
           armedDirection: null,
           pendingDirection: null,
-          skipRound: 0,
         }));
         operationLogDao.insert({
           bot_user_id: botUserId,
@@ -1106,27 +1114,11 @@ class StrategyExecutorService {
       // （已有待发/挂起时跳过，避免开奖消息与结算消息重复触发）
       const nowState = ruleStateDao.ensure(rule.id, chatId);
       if (nowState.armed_direction || nowState.pending_direction) return false;
-      // 隔一把歇一把（防 TG 风控）：上一把刚发过定位胆注 → 标记位为 1。
-      // 消费掉标记并整体跳过本把：不武装、不下注；本把结束后的下一把恢复。
-      // 只在 SPEC_FIVE 分支消费——大小玩法从不点亮该标记（防御性清零除外）。
-      if (Number(nowState.skip_round) === 1) {
-        ruleStateDao.consumeSkipRound(rule.id, chatId);
-        logger.info(
-          `[STRATEGY_EXEC] 定位胆隔把休息: 规则=${rule.id}, 群=${maskChatId(chatId)}` +
-          `（上一把刚下过注，本把跳过，下一把恢复自动下注）`
-        );
-        return false;
-      }
       // 「最近出现的 5 个不同数」（2026-10-31 主人口径变更：含最新开奖）：
       // recentValues 新→旧且含本期点数，直接去重取 5 个（不足用未出现数补齐）
       direction = pickNumbers(messageLogDao.recentValues(chatId, 40)).join(',');
     } else {
       // CLASSIC（mode=0）：保持原口径——连击满足才武装，反向下注「大/小」
-      // 防御：mode=0 正常不会有隔把标记（仅 SPEC_FIVE 点亮），若有则静默清掉
-      const nowState = ruleStateDao.ensure(rule.id, chatId);
-      if (Number(nowState?.skip_round) === 1) {
-        ruleStateDao.consumeSkipRound(rule.id, chatId);
-      }
       const need = Math.max(2, rule.streak_count || 2);
       const recentValues = messageLogDao.recentValues(chatId, need + 1).slice(1);
       direction = evaluateStreak(rule, diceValue, recentValues);
