@@ -16,7 +16,7 @@ class DashboardPanel {
   }
 
   static buildText({
-    user, account, chats, rules, throughput, todayProfit, latestFailed,
+    user, account, chats, rules, throughput, todayProfit, balanceProfit, latestFailed,
     blockedChats = [], roundProfit = null, chatStates = [],
   }) {
     let text = '🎲 <b>TG 群监听下注助手</b>\n';
@@ -82,11 +82,18 @@ class DashboardPanel {
       text += '💳 当前余额：—（等待下注回复）\n';
     }
 
-    // 今日盈利（今日已结算注的盈亏合计）
+    // 今日盈利（注单累计，参考值）+ 余额口径盈利（结论值：当前余额 − 初始余额）
     if (todayProfit != null) {
       const p = Number(todayProfit);
       const profitText = p > 0 ? `🟢 +${p}` : p < 0 ? `🔴 ${p}` : `${p}`;
-      text += `📈 今日盈利：${profitText}\n`;
+      text += `📝 注单累计（参考）：${profitText}\n`;
+    }
+    if (balanceProfit != null) {
+      const p = Number(balanceProfit);
+      const profitText = p > 0 ? `🟢 +${p}` : p < 0 ? `🔴 ${p}` : `${p}`;
+      text += `📈 盈利（余额−初始余额）：<b>${profitText}</b>\n`;
+    } else if (account.initial_balance == null) {
+      text += '📈 盈利：—（先点「🔍 初始化余额」设置基准）\n';
     }
 
     // 止盈：设置了目标就显示本轮盈利进度；达标停止后给出醒目提示

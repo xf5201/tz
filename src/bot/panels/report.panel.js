@@ -17,18 +17,21 @@ class ReportPanel {
   }
 
   static buildText({
-    todayProfit, bets = [], page = 0, total = 0, roundProfit = null, takeProfit = null,
+    todayProfit, balanceProfit = null, bets = [], page = 0, total = 0,
+    roundProfit = null, takeProfit = null,
   }) {
-    // 今日盈利（正绿负红，HTML 不支持颜色，用符号区分）
-    const profitText = todayProfit > 0
-      ? `🟢 +${todayProfit}`
-      : todayProfit < 0
-        ? `🔴 ${todayProfit}`
-        : `${todayProfit}`;
+    // 盈利结论 = 当前余额 − 初始余额（2026-11-02 主人口径）；注单累计仅作参考
+    const profitText = (b) => (b > 0 ? `🟢 +${b}` : b < 0 ? `🔴 ${b}` : `${b}`);
+    const refText = todayProfit > 0 ? `+${todayProfit}` : `${todayProfit}`;
 
     let text = '📊 <b>下注记录</b>\n';
     text += '━━━━━━━━━━━━━━━━━━━━\n';
-    text += `💰 今日盈利：<b>${profitText}</b>\n`;
+    if (balanceProfit == null) {
+      text += `💰 盈利：—（先点「🔍 初始化余额」设置基准）｜注单累计 ${refText}（参考）\n`;
+    } else {
+      text += `💰 盈利（余额−初始余额）：<b>${profitText(balanceProfit)}</b>\n`;
+      text += `📝 注单累计（参考）：${refText}\n`;
+    }
 
     // 本轮盈利（止盈判定用的那条线）：达到目标就停，手动恢复后清零重新算
     if (takeProfit != null) {

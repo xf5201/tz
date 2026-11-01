@@ -27,6 +27,30 @@ function beijingDate(nowMs = Date.now()) {
 }
 
 /**
+ * 余额口径盈利（2026-11-02 主人口径，最高优先）：
+ *
+ *   profit = 当前余额 − 基准余额（accounts.initial_balance）
+ *
+ * 余额是唯一真话——群方返还多少、扣了多少，全都在余额里。
+ * 注单逐笔累计（sumProfit）只作为「参考」展示，绝不作为盈利结论。
+ */
+
+/**
+ * 盈利 = 当前余额 − 基准余额
+ * @param {number|null} currentBalance - 当前余额（真实或模拟钱包）
+ * @param {number|null} baselineBalance - 基准余额（初始余额）
+ * @returns {number|null} 任一为空/非法返回 null（显示层显示"—"）
+ */
+function calcBalanceProfit(currentBalance, baselineBalance) {
+  // null/undefined 不能当 0 用（Number(null)=0 会把全部余额当盈利）——直接不判定
+  if (currentBalance == null || baselineBalance == null) return null;
+  const c = Number(currentBalance);
+  const b = Number(baselineBalance);
+  if (!Number.isFinite(c) || !Number.isFinite(b)) return null;
+  return Math.round((c - b) * 100) / 100;
+}
+
+/**
  * 本轮盈利 = 今日总盈利 − 基准
  *
  * @param {number} todayProfit - 今日总盈利
@@ -72,6 +96,7 @@ function isBaselineStale(baselineDate, nowMs = Date.now()) {
 
 module.exports = {
   beijingDate,
+  calcBalanceProfit,
   calcRoundProfit,
   isTakeProfitReached,
   isBaselineStale,

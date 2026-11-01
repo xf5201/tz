@@ -7,7 +7,8 @@ const messageLogDao = require('../../db/message-log.dao');
 const actionLogDao = require('../../db/action-log.dao');
 const operationLogDao = require('../../db/operation-log.dao');
 const logger = require('../../utils/logger');
-const { calcRoundProfit, isBaselineStale } = require('../../core/profit.guard');
+const { calcBalanceProfit, calcRoundProfit, isBaselineStale } = require('../../core/profit.guard');
+const { isBalanceInsufficient } = require('../../core/rule.engine');
 
 /**
  * 主面板回调处理
@@ -92,11 +93,39 @@ class DashboardHandler {
       chat_title: titleByChat[String(b.chat_id)] || null,
     }));
 
-    // 本轮盈利（止盈判定用）：今日总盈利 − 基准；跨天则基准作废，从头算
+    // ── 盈利（2026-11-02 主人口径）：余额 − 初始余额 ──
+    // 余额是唯一真话；注单累计（todayProfit）降级为「参考」展示。
+    // 模拟模式用模拟钱包推演，同一公式。
+    let balanceProfit = null;
     let roundProfit = null;
     if (account) {
-      const baseline = isBaselineStale(account.profit_baseline_date) ? 0 : account.profit_baseline;
-      roundProfit = calcRoundProfit(todayProfit, baseline);
+      const isSim = account.simulate === 1;
+      const cur = isSim ? account.sim_balance : account.balance;
+      // 基准 = 初始余额；模拟模式优先用模拟初始额
+      const base = isSim ? account.sim_initial_balance : account.initial_balance;
+      balanceProfit = calcBalanceProfit(cur, base);
+
+      // 本轮盈利（止盈判定用）：同样改为余额口径 —— 当前余额 − 止盈基准
+      // 止盈基准沿用 profit_baseline 字段语义，但单位改为「余额快照」：
+      // 兼容旧数据：profit_baseline 存的是「今日盈利累计」时的值（≤几万），
+      // 与余额（十万级）混用会算出巨幅假盈利 → 以今日盈利基线值域做启发式迁移，
+      // 第一次进入新口径时把基准落成「当前余额 − 今日盈利累计」。
+      if (account.take_profit != null && cur != null) {
+        let baselineBalance = account.profit_baseline;
+        if (!isSim
+          && baselineBalance != null
+          && Number(baselineBalance) < cur / 10) {
+          // 旧口径基准（盈利累计值）→ 迁移为余额口径
+          baselineBalance = Math.round((Number(cur) - Number(todayProfit)) * 100) / 100;
+          accountDao.snapshotProfitBaseline(botUserId, baselineBalance);
+        }
+        if (baselineBalance == null) {
+          // 无基准：以当前余额为起点（本轮从 0 开始）
+          baselineBalance = cur;
+          accountDao.snapshotProfitBaseline(botUserId, Math.round(Number(cur) * 100) / 100);
+        }
+        roundProfit = Math.round((Number(cur) - Number(baselineBalance)) * 100) / 100;
+      }
     }
 
     return {
@@ -106,6 +135,7 @@ class DashboardHandler {
       rules,
       throughput,
       todayProfit,
+      balanceProfit,
       latestFailed,
       blockedChats,
       roundProfit,

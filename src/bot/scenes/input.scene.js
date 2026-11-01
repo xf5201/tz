@@ -128,18 +128,26 @@ const FIELD_CONFIG = {
     parse: (value) => parseFloat(value),
     // 直接写 accounts，不走 wizard_state 草稿
     directApply: (botUserId, value) => {
-      const todayProfit = beijingTodayProfit(botUserId);
+      const account = accountDao.getActive(botUserId);
+      const isSim = account && account.simulate === 1;
+      const cur = account
+        ? (isSim ? account.sim_balance : account.balance)
+        : null;
       // 0 → 视为「不启用」；同时把本轮盈利清零重新开始
-      accountDao.setTakeProfit(botUserId, value > 0 ? value : null, todayProfit);
-      accountDao.resumeFromProfitStop(botUserId, todayProfit);
+      // 2026-11-02 余额口径：基准 = 当前余额快照（不再用今日盈利累计）
+      accountDao.setTakeProfit(botUserId, value > 0 ? value : null, cur);
+      accountDao.resumeFromProfitStop(botUserId);
+      if (cur != null) {
+        accountDao.snapshotProfitBaseline(botUserId, cur);
+      }
       operationLogDao.insert({
         bot_user_id: botUserId,
         action: value > 0 ? 'SET_TAKE_PROFIT' : 'CLEAR_TAKE_PROFIT',
         detail: value > 0
-          ? `设置今日止盈目标 ${value}（本轮盈利从 0 起算）`
+          ? `设置今日止盈目标 ${value}（余额口径基准 ${cur}）`
           : '关闭今日止盈',
       });
-      logger.info(`[INPUT_SCENE] 用户 ${botUserId} 止盈目标 = ${value > 0 ? value : '不启用'}`);
+      logger.info(`[INPUT_SCENE] 用户 ${botUserId} 止盈目标 = ${value > 0 ? value : '不启用'}（基准余额=${cur}）`);
     },
     format: (value) => (value == null || value === '未设置' ? '未设置' : `${value}`),
     returnPanel: 'dashboard',
@@ -331,7 +339,8 @@ function readCurrentValue(botUserId, field) {
 }
 
 /**
- * 北京时间今日 00:00 起的已结算盈亏合计（止盈基准用）
+ * 北京时间今日 00:00 起的已结算盈亏合计（注单口径，仅做参考值展示；
+ * 止盈/盈利结论已改为「当前余额 − 基准余额」口径，勿再用于判定）
  * @param {string} botUserId
  * @returns {number}
  */
