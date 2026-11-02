@@ -1,0 +1,202 @@
+// src/utils/config.loader.js
+const path = require('path');
+const fs = require('fs');
+
+/**
+ * 配置加载器
+ *
+ * 必填项：
+ *   BOT_TOKEN    - Telegram Bot Token
+ *   TG_API_ID    - Telegram API ID（兼容 API_ID 写法）
+ *   TG_API_HASH  - Telegram API Hash（兼容 API_HASH 写法）
+ *
+ * 可选项（有默认值）：
+ *   DATABASE_PATH          - 数据库路径（默认 ./data/database.db）
+ *   LOG_LEVEL              - 日志级别（默认 info）
+ *   LOG_DIR                - 日志目录（默认 ./logs）
+ *   NODE_ENV               - 运行环境（默认 production）
+ *   MESSAGE_RETENTION_DAYS - 消息流水保留天数（默认 90）
+ *   ACTION_RETENTION_DAYS  - 动作记录保留天数（默认 180）
+ *   DICE_POLL_INTERVAL_MS  - 开奖轮询间隔（默认 5000）
+ *   LOTTERY_POOL_ENABLED   - 开奖池广播模式开关（默认 true；false = 旧版逐账号轮询）
+ *   LOTTERY_CONCURRENCY    - 开奖池跨群拉取并发上限（默认 8）
+ *   LOTTERY_CATALOG_REFRESH_MS - 开奖池拓扑目录刷新周期（默认 30000）
+ *   LOTTERY_SHARD_COUNT    - 池分片总数，按群哈希分片（默认 1 = 单池全量）
+ *   LOTTERY_SHARD_INDEX    - 本进程池分片序号（默认 0）
+ *   LOG_CONSOLE            - 日志是否打印到终端（默认 false，只写日志文件）
+ *   BALANCE_NICKNAME       - 本账号在群里的下注昵称（可选，余额播报归属二次校验）
+ *   BALANCE_FLOOR          - 余额停注门槛（默认 0，余额 <= 该值全局停注）
+ */
+
+// 加载 .env（如果存在）
+const envPath = path.resolve(process.cwd(), '.env');
+if (fs.existsSync(envPath)) {
+  require('dotenv').config({ path: envPath });
+}
+
+// 兼容旧 .env 的变量名（API_ID / API_HASH）
+const API_ID_KEY = process.env.TG_API_ID ? 'TG_API_ID' : (process.env.API_ID ? 'API_ID' : 'TG_API_ID');
+const API_HASH_KEY = process.env.TG_API_HASH ? 'TG_API_HASH' : (process.env.API_HASH ? 'API_HASH' : 'TG_API_HASH');
+
+/**
+ * 必填配置项
+ */
+const REQUIRED_KEYS = ['BOT_TOKEN', API_ID_KEY, API_HASH_KEY];
+
+/**
+ * 配置默认值
+ */
+const DEFAULTS = {
+  DATABASE_PATH: './data/database.db',
+  LOG_LEVEL: 'info',
+  LOG_DIR: './logs',
+  NODE_ENV: 'production',
+  MESSAGE_RETENTION_DAYS: '90',
+  ACTION_RETENTION_DAYS: '180',
+  DICE_POLL_INTERVAL_MS: '5000',
+  // 开奖池广播模式：true = 群级代表拉取+广播（推荐）；false = 旧版逐账号轮询
+  LOTTERY_POOL_ENABLED: 'true',
+  // 开奖池跨群拉取并发上限（不同群并行，同群内串行广播保时序）
+  LOTTERY_CONCURRENCY: '8',
+  // 开奖池拓扑目录刷新周期（毫秒）
+  LOTTERY_CATALOG_REFRESH_MS: '30000',
+  // 池分片：按群哈希分片，1 = 单池全量；多进程时 COUNT=总池数、INDEX=各自序号
+  LOTTERY_SHARD_COUNT: '1',
+  LOTTERY_SHARD_INDEX: '0',
+  // 控制台日志开关：默认关闭（日志只写文件，终端保持干净）
+  LOG_CONSOLE: 'false',
+  // 本账号在群里下注时显示的昵称（可选）：余额播报里必须出现它才认领余额
+  BALANCE_NICKNAME: '',
+  // 余额停注门槛：余额 <= 该值时全局停注
+  BALANCE_FLOOR: '0',
+};
+
+/**
+ * 加载并校验配置
+ *
+ * @returns {object} 配置对象
+ * @throws {Error} 缺少必填配置时抛出
+ */
+function loadConfig() {
+  const missing = [];
+
+  // 校验必填项
+  for (const key of REQUIRED_KEYS) {
+    if (!process.env[key]) {
+      missing.push(key);
+    }
+  }
+
+  if (missing.length > 0) {
+    throw new Error(
+      `缺少必填环境变量: ${missing.join(', ')}\n` +
+      `请在 .env 文件中配置`
+    );
+  }
+
+  // 合并默认值
+  const config = {
+    // 必填
+    botToken: process.env.BOT_TOKEN,
+    tgApiId: parseInt(process.env[API_ID_KEY], 10),
+    tgApiHash: process.env[API_HASH_KEY],
+
+    // 可选（带默认值）
+    databasePath: process.env.DATABASE_PATH || DEFAULTS.DATABASE_PATH,
+    logLevel: process.env.LOG_LEVEL || DEFAULTS.LOG_LEVEL,
+    logDir: process.env.LOG_DIR || DEFAULTS.LOG_DIR,
+    nodeEnv: process.env.NODE_ENV || DEFAULTS.NODE_ENV,
+    messageRetentionDays: parseInt(
+      process.env.MESSAGE_RETENTION_DAYS || DEFAULTS.MESSAGE_RETENTION_DAYS,
+      10
+    ),
+  actionRetentionDays: parseInt(
+    process.env.ACTION_RETENTION_DAYS || DEFAULTS.ACTION_RETENTION_DAYS,
+    10
+  ),
+  dicePollIntervalMs: parseInt(
+    process.env.DICE_POLL_INTERVAL_MS || DEFAULTS.DICE_POLL_INTERVAL_MS,
+    10
+  ),
+  // 开奖池（广播模式轮询）配置
+  lotteryPoolEnabled: String(
+    process.env.LOTTERY_POOL_ENABLED ?? DEFAULTS.LOTTERY_POOL_ENABLED
+  ).toLowerCase() !== 'false',
+  lotteryConcurrency: parseInt(
+    process.env.LOTTERY_CONCURRENCY || DEFAULTS.LOTTERY_CONCURRENCY,
+    10
+  ),
+  lotteryCatalogRefreshMs: parseInt(
+    process.env.LOTTERY_CATALOG_REFRESH_MS || DEFAULTS.LOTTERY_CATALOG_REFRESH_MS,
+    10
+  ),
+  lotteryShardCount: parseInt(
+    process.env.LOTTERY_SHARD_COUNT || DEFAULTS.LOTTERY_SHARD_COUNT,
+    10
+  ),
+  lotteryShardIndex: parseInt(
+    process.env.LOTTERY_SHARD_INDEX || DEFAULTS.LOTTERY_SHARD_INDEX,
+    10
+  ),
+  // 终端日志开关：LOG_CONSOLE=true 才往终端打印，否则只写日志文件
+  logConsole: String(process.env.LOG_CONSOLE || DEFAULTS.LOG_CONSOLE).toLowerCase() === 'true',
+  // 余额播报昵称校验（空 = 不校验，仅靠 reply 归属）
+  balanceNickname: (process.env.BALANCE_NICKNAME || DEFAULTS.BALANCE_NICKNAME).trim(),
+  // 余额停注门槛：余额 <= 该值全局停注（默认 0）
+  balanceFloor: Number.isFinite(parseFloat(process.env.BALANCE_FLOOR))
+    ? parseFloat(process.env.BALANCE_FLOOR)
+    : parseFloat(DEFAULTS.BALANCE_FLOOR),
+};
+
+  // 校验 TG_API_ID 为数字
+  if (isNaN(config.tgApiId)) {
+    throw new Error(`${API_ID_KEY} 必须为数字`);
+  }
+
+  return config;
+}
+
+/**
+ * 获取配置（单例缓存）
+ * @returns {object}
+ */
+let _cachedConfig = null;
+function getConfig() {
+  if (!_cachedConfig) {
+    _cachedConfig = loadConfig();
+  }
+  return _cachedConfig;
+}
+
+/**
+ * 获取单个配置项
+ * @param {string} key
+ * @returns {*}
+ */
+function get(key) {
+  return getConfig()[key];
+}
+
+/**
+ * 判断是否为生产环境
+ * @returns {boolean}
+ */
+function isProduction() {
+  return getConfig().nodeEnv === 'production';
+}
+
+/**
+ * 判断是否为开发环境
+ * @returns {boolean}
+ */
+function isDevelopment() {
+  return getConfig().nodeEnv === 'development';
+}
+
+module.exports = {
+  loadConfig,
+  getConfig,
+  get,
+  isProduction,
+  isDevelopment,
+};
