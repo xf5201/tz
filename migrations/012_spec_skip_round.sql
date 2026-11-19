@@ -1,0 +1,12 @@
+-- 012_spec_skip_round.sql
+-- 定位胆（SPEC_FIVE, mode=1）隔期下注节奏（防 TG 风控）（2026-11-02）：
+--   主人口径：「定位胆每下注一把就等待一把后再下注」——
+--   下注的那一把之后，紧接着的一把不武装、不下注，隔一把再恢复自动下注。
+--
+--   实现：rule_chat_state.skip_round（1 = 下一把休息）
+--     · 下注窗口即将发送定位胆注单（ handleRoundOpen 确定下注那刻）→ 置 1
+--     · 该注结算后的下一次武装/下注机会 → 发现为 1 则跳过本把并清 0
+--   大小玩法（mode=0）行为不变，也不会点亮该标记。
+-- 增量迁移：旧库自动补列，默认 0（立即恢复原有节奏）。
+-- #ifMissingColumn(rule_chat_state.skip_round)
+ALTER TABLE rule_chat_state ADD COLUMN skip_round INTEGER NOT NULL DEFAULT 0;

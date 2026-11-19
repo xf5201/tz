@@ -1,0 +1,13 @@
+node_modules/
+data/
+logs/
+*.log
+.env
+*.diff
+*.diff
+*.diff
+
+# TDlib 动态库随项目走
+vendor/tdlib/*
+!vendor/tdlib/libtdjson.so.1.8.70
+!vendor/tdlib/libtdjson.so
