@@ -271,13 +271,12 @@ class MessageDispatcherService {
   /**
    * 判定一条余额播报属于哪个账号
    *
-   * 群里每个人下注后机器人都会回复一条余额播报，全都长得一样，
-   * 因此只能靠「这条消息回复的是谁的下注消息」来区分：
-   *   1. 消息必须是回复消息（reply_to）
-   *   2. 被回复的 msg_id 必须命中本群 action_logs 里我们发出的下注消息
-   *   3. 该下注记录的账号必须在监听本群（targets）
-   * 另外：若 .env 配了 BALANCE_NICKNAME（自己在本群的下注昵称），
-   * 还要求播报里出现该昵称，双重确认，避免同群多账号串账。
+   * 群里每个人下注后机器人都会回复一条余额播报，全都长得一样。
+   * 归属判定优先级（从硬到软）：
+   *   1. 艾特实体（textEntityTypeMentionName → user_id）：机器人回复我们＝艾特我们，
+   *      实体里直接带账号 TG id（实测 1092068467），天然唯一、与 reply_to / 乐观 id 脱钩；
+   *   2. reply_to 命中本群 action_logs 里我们发出的下注消息（id 校正后可用，兜底）；
+   *   3. .env BALANCE_NICKNAME 昵称校验（最后防线）
    *
    * @param {object} message
    * @param {string} chatId
@@ -285,16 +284,27 @@ class MessageDispatcherService {
    * @returns {{owner: string, bet: object}|null} 归属账号与该笔下注记录；无法归属返回 null
    */
   _resolveBalanceOwner(message, chatId, targets) {
-    const replyToMsgId = getReplyToMsgId(message);
-    if (!replyToMsgId) return null;
+    const targetSet = targets.map(String);
 
-    const bet = actionLogDao.getByBetMsgId(chatId, replyToMsgId);
-    if (!bet) return null;
+    // ① 艾特实体归属（最硬）：机器人回复谁就艾特谁，user_id 即账号 id
+    let mentionOwner = null;
+    if (message.mentionUserIds && Array.isArray(message.mentionUserIds)) {
+      const hit = message.mentionUserIds.find((uid) => targetSet.includes(String(uid)));
+      if (hit) mentionOwner = String(hit);
+    }
+    // 实体里没命中（媒体 caption 等边缘场景）→ 再用 reply_to 找我们发出的下注记录
+    let bet = null;
+    if (!mentionOwner) {
+      const replyToMsgId = getReplyToMsgId(message);
+      if (!replyToMsgId) return null;
+      bet = actionLogDao.getByBetMsgId(chatId, replyToMsgId);
+      if (!bet) return null;
+      const ownerFromBet = String(bet.bot_user_id);
+      if (!targetSet.includes(ownerFromBet)) return null;
+      mentionOwner = ownerFromBet;
+    }
 
-    const owner = String(bet.bot_user_id);
-    if (!targets.map(String).includes(owner)) return null;
-
-    // 可选昵称校验（.env BALANCE_NICKNAME）
+    // 可选昵称校验（.env BALANCE_NICKNAME），双保险
     let nickname = null;
     try {
       nickname = getConfigValue('balanceNickname');
@@ -302,7 +312,15 @@ class MessageDispatcherService {
       nickname = null;
     }
     if (nickname && !String(message.message || '').includes(nickname)) return null;
-    return { owner, bet };
+
+    // 若走 reply_to 分支没拿到 bet，补查一次（方便 handleBetConfirmed/Rejected 用）
+    if (!bet && mentionOwner) {
+      const replyToMsgId = getReplyToMsgId(message);
+      if (replyToMsgId) {
+        bet = actionLogDao.getByBetMsgId(chatId, replyToMsgId) || null;
+      }
+    }
+    return { owner: mentionOwner, bet };
   }
 }
 

@@ -13,7 +13,58 @@ function toGramjsMessage(tdMsg) {
   if (c && c.message_text && c.message_text.text && c.message_text.text.text) message = c.message_text.text.text;
   else if (c && c.text && c.text.text) message = c.text.text;
   else if (typeof c === "string") message = c;
-  return { id: tdMsg.id, chatId, senderId, message, reply: replyToMsgId, _td: tdMsg, _type: "tlib" };
+  // 带 caption 的媒体消息（动画/图片/视频/文档等）：开盘信号常用 GIF+底注文字，
+  // caption 是 formattedText 对象（{text, entities}），旧代码只认 messageText 导致文本恒空。
+  if (!message && c) {
+    const cap = c.caption;
+    if (cap) {
+      if (typeof cap === "string") {
+        message = cap;
+      } else if (Array.isArray(cap)) {
+        for (const item of cap) {
+          const t = item && item.text ? (item.text.text || item.text) : (item || "");
+          if (t) { message += t; }
+        }
+      } else if (cap.text) {
+        message = (cap.text.text || cap.text) || "";
+      }
+    }
+  }
+  return {
+    id: tdMsg.id,
+    chatId,
+    senderId,
+    message,
+    reply: replyToMsgId,
+    // 机器人回复我们＝艾特我们（textEntityTypeMentionName 实体，user_id 即账号 id）。
+    // 余额播报归属用它最可靠：天然唯一、不受 reply_to id 对不上的影响（实测 1092068467）
+    mentionUserIds: extractMentionUserIds(tdMsg),
+    _td: tdMsg,
+    _type: "tlib",
+  };
+}
+
+/**
+ * 从 TDlib message 提取「艾特」实体的账号 id 列表。
+ * 机器人对下注人的回复会用 textEntityTypeMentionName 艾特对应的人，
+ * 实体里带 user_id；余额归属以它为准（比 reply_to / 昵称都硬）。
+ */
+function extractMentionUserIds(tdMsg) {
+  const out = [];
+  try {
+    if (!tdMsg || !tdMsg.content) return out;
+    // 普通文本的 entities
+    const textEnts = (tdMsg.content.text && tdMsg.content.text.entities) || [];
+    // 带 caption 的媒体（动画/图片）里的 entities
+    const captionEnts = (tdMsg.content.caption && tdMsg.content.caption.entities) || [];
+    for (const e of [...textEnts, ...captionEnts]) {
+      if (e && e.type && e.type["@type"] === "textEntityTypeMentionName" && e.type.user_id) {
+        const uid = String(e.type.user_id);
+        if (!out.includes(uid)) out.push(uid);
+      }
+    }
+  } catch (_) { /* 提取失败不阻塞 */ }
+  return out;
 }
 
 class TdSessionClient {
@@ -24,6 +75,8 @@ class TdSessionClient {
     this._eventHandlers = [];
     this._authWaiters = [];
     this._stateWaiters = [];
+    // 已加载过的 chat_id（TDlib 语义：getChatHistory 前 chat 必须先加载）
+    this._loadedChats = new Set();
   }
   get raw() { return this._client; }
   async connect() {
@@ -113,30 +166,66 @@ class TdSessionClient {
     return { id: res.id, username: res.username, name: ((res.first_name || "") + " " + (res.last_name || "")).trim() };
   }
   /**
-   * 将 marked 格式群 ID（-100xxx / -xxx，库里存储格式）转回 TDlib 内部 chat_id
+   * 将 marked 格式群 ID 转回 TDlib 内部 chat_id。
+   * 兼容两种输入：
+   *   1. TDlib 原生负 id：-100xxxxxxxxx / -xxxxxxxxx（getDialogs 新格式、监听推送）→ 原样返回
+   *   2. 库里旧 bug 存的双负号：-100-100xxxxxxxxx（getDialogs 拼错时代保存的）→ 剥掉一层 -100
+   * 旧实现见 s.startsWith("-100") 就 slice(4)，会把单负号 -100xxx 错切成正数 xxx，导致 Chat not found。
    */
   _toTdlibChatId(chatId) {
     const s = String(chatId || "").trim();
-    if (s.startsWith("-100")) return Number(s.slice(4));
-    if (s.startsWith("-")) return Number(s.slice(1));
-    return Number(s);
+    if (s.startsWith("-100-")) return Number(s.slice(4)); // 双负号 → 剥成 -100xxx
+    return Number(s); // 单负号 / 正数原样
+  }
+  /**
+   * 确保 chat 已加载：getChatHistory 前 TDlib 要求 chat 已在内存（否则 400 Chat not found）。
+   * 实测：先 getChats 全量加载后再操作必成功；这里用 set 缓存避免每次全量拉取。
+   */
+  async _ensureChatLoaded(chatId) {
+    const key = String(chatId);
+    if (this._loadedChats.has(key)) return;
+    const r = await this._client.send({ "@type": "getChat", chat_id: chatId, timeoutMs: 8000 }).catch(() => null);
+    if (r && r["@type"] !== "error" && r.id != null) {
+      this._loadedChats.add(key);
+      return;
+    }
+    // 单查未加载 → 全量拉一次（TDlib 建立所有 chat 缓存）
+    const cr = await this._client.send({
+      "@type": "getChats",
+      chat_list: { "@type": "chatListMain" },
+      limit: 200,
+      timeoutMs: 15000,
+    }).catch(() => null);
+    if (cr && Array.isArray(cr.chat_ids)) {
+      for (const cid of cr.chat_ids) this._loadedChats.add(String(cid));
+    }
+    this._loadedChats.add(key);
   }
   async getMessages(chatId, opts) {
     opts = opts || {};
     const limit = opts.limit || 30;
-    const res = await this._client.send({ "@type": "getChatHistory", chat_id: this._toTdlibChatId(chatId), from_message_id: 0, offset: 0, limit, only_local: false, timeoutMs: 20000 });
+    const tid = this._toTdlibChatId(chatId);
+    // TDlib 语义：getChatHistory 前必须先加载 chat（getChat/getChats），否则 400 Chat not found
+    await this._ensureChatLoaded(tid);
+    const res = await this._client.send({ "@type": "getChatHistory", chat_id: tid, from_message_id: 0, offset: 0, limit, only_local: false, timeoutMs: 20000 });
     if (res && res["@type"] === "error") throw new Error(res.code + ": " + res.message);
     return (res.messages || []).map(toGramjsMessage).filter(Boolean);
   }
   /**
    * 发送文本消息（TDlib 版，兼容 GramJS sendMessage 调用：client.sendMessage(chatId, { message })）
    * 返回 TDlib message 对象（含 id），与 GramJS 返回结构兼容。
+   *
+   * 注意：TDlib sendMessage 返回的 id 是「本地乐观 id」，服务端最终 id 不同步；
+   * 余额播报靠 reply_to 匹配我们下注消息的真实 id，id 对不上会导致余额被过滤。
+   * 因此发送成功后拉最新历史，找自己发的、文本匹配的消息，取服务端真实 id 返回。
    */
   async sendMessage(chatId, params = {}) {
     const text = String(params.message != null ? params.message : (params.text != null ? params.text : ""));
+    const tid = this._toTdlibChatId(chatId);
+    await this._ensureChatLoaded(tid);
     const res = await this._client.send({
       "@type": "sendMessage",
-      chat_id: this._toTdlibChatId(chatId),
+      chat_id: tid,
       input_message_content: {
         "@type": "inputMessageText",
         text: { "@type": "formattedText", text, entities: [] },
@@ -146,7 +235,27 @@ class TdSessionClient {
       timeoutMs: 20000,
     });
     if (res && res["@type"] === "error") throw new Error(res.code + ": " + res.message);
-    return res; // message 对象含 id
+    // 校正真实 id：拉最新历史，找自己发出、文本归一化后完全一致的那条消息
+    const norm = text.replace(/\s+/g, '');
+    for (let i = 0; i < 5; i++) {
+      await new Promise((r) => setTimeout(r, 600));
+      try {
+        const hist = await this._client.send({
+          "@type": "getChatHistory", chat_id: tid, from_message_id: 0, offset: 0,
+          limit: 10, only_local: false, timeoutMs: 12000,
+        });
+        if (hist && hist["@type"] !== "error" && Array.isArray(hist.messages)) {
+          const mine = hist.messages.find((m) => {
+            if (!m.is_outgoing) return false;
+            const c = m.content;
+            if (!c || c["@type"] !== "messageText" || !c.text) return false;
+            return String(c.text.text || "").replace(/\s+/g, '') === norm;
+          });
+          if (mine) return mine;
+        }
+      } catch (_) { /* 重试 */ }
+    }
+    return res; // 兜底：返回原始对象（至少不阻塞下注）
   }
   /**
    * 拉取对话列表（TDlib 版，兼容 GramJS getDialogs 返回结构）
@@ -173,11 +282,14 @@ class TdSessionClient {
         let markedId = null;
         if (t && t["@type"] === "chatTypeBasicGroup") {
           isGroup = true;
-          markedId = "-" + id;
+          // TDlib 的 chat_id 本身就是负数（-groupId），即 GramJS marked 格式（-xxx）
+          markedId = String(id);
         } else if (t && t["@type"] === "chatTypeSupergroup") {
           isGroup = true;
           isChannel = !!t.is_channel;
-          markedId = "-100" + id;
+          // TDlib 超级群 chat_id 本身就是 -100xxxxxxxxxx（负数+前缀），
+          // 直接 String 即 GramJS marked 格式；不能再拼 "-100"+id 否则会成 -100-100xxx
+          markedId = String(id);
         } else {
           continue; // 私有/密聊不看
         }

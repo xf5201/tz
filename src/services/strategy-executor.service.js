@@ -77,7 +77,9 @@ const SPEC_WAVE_PERIOD_MS = Math.max(1000, Number(process.env.DICE_SPEC_WAVE_PER
 const DAILY_RUNTIME_MS = 8 * 60 * 60 * 1000;   // 每天累计运行上限：8 小时
 const SESSION_RUN_MIN_MS = 2 * 60 * 60 * 1000; // 每段最短运行：2 小时
 const SESSION_RUN_MAX_MS = 3 * 60 * 60 * 1000; // 每段最长运行：3 小时
-const REST_BREAK_MS = 5 * 60 * 1000;           // 停会后休息时长：5 分钟
+const REST_BREAK_MIN_MS = 20 * 60 * 1000;       // 停会后休息时长下限：20 分钟
+const REST_BREAK_MAX_MS = 30 * 60 * 1000;       // 停会后休息时长上限：30 分钟
+const RUNTIME_WATCH_INTERVAL_MS = 30 * 1000;    // 运行时状态巡检间隔：30 秒（休息到点自动重连，不依赖消息触发）
 // 补偿模式下「输的群」判定：连败 > 0 且未被单独停注
 // 赢到「连败清零」即视为补偿完成（下一把恢复基础注 = 打平重新开始）
 const RUNTIME_LOG_PREFIX = '[RUNTIME]';
@@ -154,12 +156,55 @@ class StrategyExecutorService {
     //     loggedOutAt:    登出时间戳（补偿完成、当日收工）
     //   }
     this._runtimeState = new Map();
-
     // 每群回合追踪（内存，重启后由下一条开盘消息/骰子重建）：
     //   _chatRounds  chatId → { period, atMs }   最近一次开盘信号的期号与到达时间
     //   _diceHistory chatId → [{ value, period, msgId, capturedAtMs }] 最近的骰子（新→旧）
     this._chatRounds = new Map();
     this._diceHistory = new Map();
+    // ── 运行时状态巡检：休息到点自动重连（时间驱动，不依赖消息触发）──
+    this._runtimeWatchTimer = setInterval(() => {
+      this._sweepRuntimeResume().catch((err) => {
+        logger.warn(`[RUNTIME] 运行时巡检异常: ${err.message}`);
+      });
+    }, RUNTIME_WATCH_INTERVAL_MS);
+    if (this._runtimeWatchTimer.unref) this._runtimeWatchTimer.unref();
+  }
+  /**
+   * 随机休息时长（20~30 分钟）
+   */
+  _randomRestBreak() {
+    return REST_BREAK_MIN_MS + Math.floor(Math.random() * (REST_BREAK_MAX_MS - REST_BREAK_MIN_MS));
+  }
+  /**
+   * 巡检所有在休息中的账号：休息时间到 → 立即自动重连（时间驱动，不依赖消息）
+   */
+  async _sweepRuntimeResume() {
+    for (const [botUserId, st] of this._runtimeState.entries()) {
+      if (!st.offline || st.dayDone) continue;
+      if (Date.now() < st.offlineUntil) continue;
+      try {
+        this._resumeFromRest(botUserId, st);
+      } catch (e) {
+        logger.warn(`[RUNTIME] 用户 ${botUserId} 定时重连触发异常: ${e.message}`);
+      }
+    }
+  }
+  /**
+   * 休息结束恢复：重置运行态 + 重连（消息触发与定时器共用的唯一出口）
+   */
+  _resumeFromRest(botUserId, st) {
+    const now = Date.now();
+    st.offline = false;
+    st.offlineUntil = 0;
+    st.sessionStartTs = now;
+    st.sessionDurMs = this._randomSessionDur();
+    st.compensation = false;
+    logger.info(
+      `${RUNTIME_LOG_PREFIX} 用户 ${botUserId} 休息结束，自动重连并开始新一段（随机 ${Math.round(st.sessionDurMs / 3600000)}h）`
+    );
+    this._reconnectForResume(botUserId).catch((err) => {
+      logger.warn(`${RUNTIME_LOG_PREFIX} 用户 ${botUserId} 重连失败: ${err.message}`);
+    });
   }
 
   /**
@@ -1347,22 +1392,11 @@ class StrategyExecutorService {
     const now = Date.now();
     // ── 今日已收工：累计达标且所有群都赢 → 保持离线，等明天 ──
     if (st.dayDone) return 'REST';
-    // ── 休息中（连接已断开）：等休息结束才恢复 ──
+    // ── 休息中（连接已断开）：休息到点由独立定时器每 30s 巡检自动重连（时间驱动）；
+    //    消息入口触达时若已到点也立即恢复，双保险不依赖任何消息 ──
     if (st.offline) {
       if (now < st.offlineUntil) return 'REST';
-      // 休息结束：重新登录恢复（异步重连，不阻塞当前消息处理；
-      // 重连成功后 listener 会重新挂载，后续消息自然继续处理）
-      st.offline = false;
-      st.offlineUntil = 0;
-      st.sessionStartTs = now;
-      st.sessionDurMs = this._randomSessionDur();
-      st.compensation = false;
-      logger.info(
-        `${RUNTIME_LOG_PREFIX} 用户 ${botUserId} 休息结束，重连并开始新一段（随机 ${Math.round(st.sessionDurMs / 3600000)}h）`
-      );
-      this._reconnectForResume(botUserId).catch((err) => {
-        logger.warn(`${RUNTIME_LOG_PREFIX} 用户 ${botUserId} 重连失败: ${err.message}`);
-      });
+      this._resumeFromRest(botUserId, st);
       return 'OK';
     }
     // ── 段到点 → 进补偿模式 ──
@@ -1402,9 +1436,12 @@ class StrategyExecutorService {
           this._logoffForToday(botUserId).catch(() => {});
           return 'REST';
         }
-        // 未到今日上限 → 休息一段，之后继续
+        // 未到今日上限 → 休息一段（20~30 分钟随机），到点由定时器自动重连
         st.offline = true;
-        st.offlineUntil = now + REST_BREAK_MS;
+        st.offlineUntil = now + this._randomRestBreak();
+        logger.info(
+          `${RUNTIME_LOG_PREFIX} 用户 ${botUserId} 补偿完成，休息 ${Math.round((st.offlineUntil - now) / 60000)} 分钟后自动重连`
+        );
         this._logoffForRest(botUserId).catch(() => {});
         return 'REST';
       }
